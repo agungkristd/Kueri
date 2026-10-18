@@ -8,6 +8,14 @@ import SwiftUI
 struct Conn: Codable, Identifiable, Hashable {
     enum Kind: String, Codable, CaseIterable {
         case sqlite = "SQLite", postgres = "PostgreSQL", mysql = "MySQL / MariaDB", redis = "Redis"
+        var shortName: String { self == .mysql ? "MySQL" : rawValue }
+        var icon: String {
+            switch self {
+            case .postgres, .mysql: "cylinder.split.1x2"
+            case .sqlite: "doc"
+            case .redis: "memorychip"
+            }
+        }
         var defaults: (port: String, user: String, database: String) {
             switch self {
             case .postgres: ("5432", "postgres", "postgres")
@@ -127,6 +135,15 @@ enum LegacyMigration {
                                      allowPublicKeyRetrieval: c.allowPublicKeyRetrieval ?? false, tls: c.tlsMode, via: via)
             case .redis: try RedisDB(host: c.host, port: c.port, user: c.user, password: pw, database: c.database,
                                      allowCleartextPassword: c.allowCleartextPassword ?? false, tls: c.tlsMode, via: via)
+            }
+            // Query timeout from Settings, enforced by the server for this session.
+            let timeout = Prefs.queryTimeout
+            if timeout > 0 {
+                switch c.kind {
+                case .postgres: _ = try? db.query("SET statement_timeout = \(timeout * 1000)")
+                case .mysql: _ = try? db.query("SET SESSION max_execution_time = \(timeout * 1000)")
+                default: break
+                }
             }
             return (db, try db.tables(), (try? db.databases()) ?? [], (try? db.schemas()) ?? [], tunnel, (try? db.serverVersion()) ?? "")
         }.value
@@ -323,12 +340,24 @@ enum LegacyMigration {
         if a.contains("--selftest") { selfTest(); exit(0) }
         if a.contains("--bench") { MainActor.assumeIsolated { bench() }; exit(0) }
         if let i = a.firstIndex(of: "--probe"), a.count >= i + 8 { probe(Array(a[(i + 1)...])); exit(0) }
+        NotificationCenter.default.addObserver(forName: NSApplication.didFinishLaunchingNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                Appearance.current.apply()
+                // Restored windows otherwise open behind the app that was in front (the cooperative
+                // NSApp.activate() isn't granted at launch).
+                NSApp.activate(ignoringOtherApps: true)
+            }
+        }
     }
     @State private var store = Store()
     var body: some Scene {
         WindowGroup(id: "main") { RootView().environment(store) }
             .defaultSize(width: 1100, height: 700)
-            .commands { TabCommands() }
+            .commands {
+                TabCommands()
+                AppearanceCommands()
+            }
+        Settings { SettingsView() }
     }
 }
 
@@ -373,7 +402,7 @@ struct RootView: View {
     }
 
     private func restore() async {
-        guard session == nil, let c = Self.restorable(store.conns, connID: connID, database: database) else { return }
+        guard session == nil, Prefs.reopenTabs, let c = Self.restorable(store.conns, connID: connID, database: database) else { return }
         restoring = c.name
         defer { restoring = nil }
         do { session = try await Session.open(c) }
@@ -413,18 +442,21 @@ extension View {
 /// SwiftUI's `.help` doesn't reach bridged NSToolbarItems (their toolTip stayed nil, measured),
 /// so tooltips are set on each item as AppKit adds it, by label. Also covers Run ⇄ Stop swaps.
 enum ToolbarTooltips {
-    static let byLabel = [
-        "Run": "Run query (⌘↩)",
-        "Stop": "Stop query (⌘.)",
-        "SQL Editor": "Show/hide SQL editor (⇧⌘E)",
-        "History": "Show query history in the sidebar (⌘Y)",
-        "Disconnect": "Disconnect",
-        "Processes": "Server processes: see and kill client connections (⇧⌘P)",
-        "New Tab": "New connection tab (⌘T)",
-        "Sidebar": "Show/hide tables (⌘B)",
-        "Details": "Show/hide row details (⌥⌘B)",
-    ]
-    static func apply(_ item: NSToolbarItem) {
+    @MainActor static var byLabel: [String: String] {
+        let k = Keymap.shared
+        return [
+            "Run": "Run query (\(k.display(.run)))",
+            "Stop": "Stop query (\(k.display(.stop)))",
+            "SQL Editor": "Show/hide SQL editor (\(k.display(.toggleEditor)))",
+            "History": "Show query history in the sidebar (\(k.display(.history)))",
+            "Disconnect": "Disconnect",
+            "Processes": "Server processes: see and kill client connections (\(k.display(.processes)))",
+            "New Tab": "New connection tab",
+            "Sidebar": "Show/hide tables (\(k.display(.toggleSidebar)))",
+            "Details": "Show/hide row details (\(k.display(.toggleDetails)))",
+        ]
+    }
+    @MainActor static func apply(_ item: NSToolbarItem) {
         if let tip = byLabel[item.label] { item.toolTip = tip }
     }
     static func install() {
@@ -446,6 +478,7 @@ struct NewTabButton: View {
 
 struct RenameConnectionKey: FocusedValueKey { typealias Value = () -> Void }
 struct SwitchDatabaseKey: FocusedValueKey { typealias Value = () -> Void }
+struct NewQueryTabKey: FocusedValueKey { typealias Value = () -> Void }
 extension FocusedValues {
     var switchDatabase: (() -> Void)? {
         get { self[SwitchDatabaseKey.self] }
@@ -456,20 +489,54 @@ extension FocusedValues {
         get { self[RenameConnectionKey.self] }
         set { self[RenameConnectionKey.self] = newValue }
     }
+    var newQueryTab: (() -> Void)? {
+        get { self[NewQueryTabKey.self] }
+        set { self[NewQueryTabKey.self] = newValue }
+    }
+}
+
+/// App theme: follow the system, or force light / dark. Remembered across launches.
+enum Appearance: String, CaseIterable {
+    case system, light, dark
+    static let key = "appearance"
+    static var current: Appearance { UserDefaults.standard.string(forKey: key).flatMap(Appearance.init) ?? .system }
+    var title: String { rawValue.capitalized }
+    @MainActor func apply() {
+        NSApp?.appearance = switch self { case .system: nil; case .light: NSAppearance(named: .aqua); case .dark: NSAppearance(named: .darkAqua) }
+    }
+}
+
+struct AppearanceCommands: Commands {
+    @AppStorage(Appearance.key) private var appearance = Appearance.system.rawValue
+    var body: some Commands {
+        CommandGroup(after: .toolbar) {
+            Picker("Appearance", selection: Binding(get: { Appearance(rawValue: appearance) ?? .system },
+                                                    set: { appearance = $0.rawValue; $0.apply() })) {
+                ForEach(Array(Appearance.allCases.enumerated()), id: \.element) { i, a in
+                    Text(a.title).tag(a).keyboardShortcut(KeyEquivalent(Character(String(i + 1))), modifiers: [.command, .control])
+                }
+            }
+        }
+    }
 }
 
 struct TabCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     @FocusedValue(\.renameConnection) private var renameConnection
     @FocusedValue(\.switchDatabase) private var switchDatabase
+    @FocusedValue(\.newQueryTab) private var newQueryTab
     var body: some Commands {
         CommandGroup(after: .newItem) {
-            Button("New Tab") { openWindow(id: "main") }.keyboardShortcut("t", modifiers: .command)
+            Button("New Tab") {
+                if Prefs.newTabOpensQuery, let newQueryTab { newQueryTab() } else { openWindow(id: "main") }
+            }
+            .shortcut(.newTab)
+            Button("New Connection Tab") { openWindow(id: "main") }
             Button("Rename Connection…") { renameConnection?() }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .shortcut(.renameConnection)
                 .disabled(renameConnection == nil)
             Button("Switch Database…") { switchDatabase?() }
-                .keyboardShortcut("k", modifiers: .command)
+                .shortcut(.switchDatabase)
                 .disabled(switchDatabase == nil)
         }
     }
@@ -505,6 +572,7 @@ struct ConnectionsView: View {
     @State private var draft = Conn()
     @State private var error: String?
     @State private var connecting = false
+    @State private var tested: String?
     @State private var pendingDelete: Conn?
     @FocusState private var renaming: Bool
     var notice: String?
@@ -514,6 +582,7 @@ struct ConnectionsView: View {
         NavigationSplitView {
             List(store.conns, selection: $selection) { c in
                 HStack {
+                    Image(systemName: c.kind.icon).foregroundStyle(.secondary).frame(width: 18)
                     VStack(alignment: .leading) {
                         Text(c.name)
                         Text(c.kind == .sqlite ? c.path : "\(c.user)@\(c.host):\(c.port)/\(c.database)")
@@ -543,63 +612,21 @@ struct ConnectionsView: View {
             } message: { Text("Its saved password is removed too.") }
             .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
-            Form {
-                TextField("Name", text: $draft.name).selectAllOnFocus().focused($renaming)
-                    .onSubmit { save() }
-                Picker("Type", selection: $draft.kind) { ForEach(Conn.Kind.allCases, id: \.self) { Text($0.rawValue) } }
-                if draft.kind == .sqlite {
-                    HStack {
-                        TextField("File", text: $draft.path).selectAllOnFocus()
-                        Button("Choose…") { pickFile() }
-                    }
-                } else {
-                    TextField("Host", text: $draft.host).selectAllOnFocus()
-                    TextField("Port", text: $draft.port).selectAllOnFocus()
-                    TextField(draft.kind == .redis ? "User (ACL, optional)" : "User", text: $draft.user).selectAllOnFocus()
-                    SecureField("Password", text: Binding(get: { draft.password ?? "" },
-                                                          set: { draft.password = $0.isEmpty ? nil : $0 })).selectAllOnFocus()
-                    TextField(draft.kind == .redis ? "DB index" : "Database", text: $draft.database).selectAllOnFocus()
-                    Toggle("Connect over SSH", isOn: Binding(get: { draft.useSSH ?? false }, set: { draft.useSSH = $0 }))
-                        .help("Tunnels through an SSH server using your ~/.ssh config, keys and ssh-agent. Password login isn't supported.")
-                    if draft.useSSH == true {
-                        TextField("SSH host", text: Binding(get: { draft.sshHost ?? "" }, set: { draft.sshHost = $0 })).selectAllOnFocus()
-                        TextField("SSH port", text: Binding(get: { draft.sshPort ?? "22" }, set: { draft.sshPort = $0 })).selectAllOnFocus()
-                        TextField("SSH user", text: Binding(get: { draft.sshUser ?? "" }, set: { draft.sshUser = $0 })).selectAllOnFocus()
-                        HStack {
-                            TextField("SSH key (optional)", text: Binding(get: { draft.sshKey ?? "" }, set: { draft.sshKey = $0 }))
-                            Button("Choose…") { pickKey() }
-                        }
-                        Text("Host and port above are as seen from the SSH server (often localhost).")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Picker("TLS / SSL", selection: Binding(get: { draft.tlsMode }, set: { draft.tls = $0 })) {
-                        ForEach(TLSMode.allCases.filter { draft.kind != .redis || $0 != .prefer }, id: \.self) { Text($0.title).tag($0) }
-                    }
-                    .help("Required suits servers with a self-signed certificate (e.g. a home server). Verify also checks the certificate and host name.")
-                    Toggle("Production database", isOn: Binding(get: { draft.isProduction ?? false }, set: { draft.isProduction = $0 }))
-                        .help("Marks the connection and asks before UPDATE/DELETE without WHERE, DROP, TRUNCATE, saving edits and importing.")
-                    if draft.kind == .postgres || draft.kind == .redis {
-                        Toggle("Allow cleartext password", isOn: Binding(get: { draft.allowCleartextPassword ?? false },
-                                                                        set: { draft.allowCleartextPassword = $0 }))
-                            .help(draft.kind == .redis
-                                  ? "Redis connections aren't encrypted yet: only enable for servers on a network you trust."
-                                  : "Only for servers configured with the 'password' auth method. Without TLS the password then crosses the network unencrypted.")
-                    }
-                    if draft.kind == .mysql {
-                        Toggle("Allow public key retrieval", isOn: Binding(get: { draft.allowPublicKeyRetrieval ?? false },
-                                                                          set: { draft.allowPublicKeyRetrieval = $0 }))
-                            .help("MySQL 8 may need its RSA key to log in without TLS. Only enable on a network you trust (localhost, your LAN).")
-                    }
+            ScrollView { // only scrolls when the window is shorter than the form
+                VStack(alignment: .leading, spacing: 0) {
+                    header.padding(16)
+                    Divider()
+                    fields.padding(16)
+                    Divider()
+                    footer
                 }
-                if let error = error ?? notice { Text(error).foregroundStyle(.red).textSelection(.enabled) }
-                HStack {
-                    Button("Save") { save() }
-                    Button("Connect") { connect() }.keyboardShortcut(.defaultAction).disabled(connecting)
-                    if connecting { ProgressView().controlSize(.small) }
-                }
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.2)))
+                .frame(maxWidth: 560)
+                .padding(24)
+                .frame(maxWidth: .infinity)
             }
-            .formStyle(.grouped)
-            .frame(maxWidth: 520)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
         .onChange(of: draft.kind) { old, new in
             // Only swap defaults the user hasn't customised.
@@ -610,7 +637,179 @@ struct ConnectionsView: View {
         }
         .onChange(of: selection) { _, id in
             guard let c = store.conns.first(where: { $0.id == id }) else { return }
-            draft = c; error = nil
+            draft = c; error = nil; tested = nil
+        }
+        .onChange(of: draft) { old, new in if old.id == new.id { tested = nil } } // a changed form needs a new test
+    }
+
+    private var summary: String {
+        switch draft.kind {
+        case .sqlite: draft.path.isEmpty ? "No file chosen" : draft.path
+        default:
+            (draft.user.isEmpty ? "" : draft.user + "@") + (draft.host.isEmpty ? "localhost" : draft.host)
+                + (draft.port.isEmpty ? "" : ":" + draft.port) + (draft.database.isEmpty ? "" : "/" + draft.database)
+                + (draft.useSSH == true ? " via \(draft.sshHost ?? "ssh")" : "")
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Image(systemName: draft.kind.icon).font(.system(size: 22)).foregroundStyle(.secondary).frame(width: 30)
+            VStack(alignment: .leading, spacing: 2) {
+                TextField("Name", text: $draft.name, prompt: Text("Connection name"))
+                    .labelsHidden().textFieldStyle(.plain).font(.title3.weight(.semibold))
+                    .selectAllOnFocus().focused($renaming).onSubmit { save() }
+                Text(summary).font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
+            if draft.isProduction == true {
+                Text("Production").font(.caption.weight(.semibold)).foregroundStyle(.white)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(ConnectionBar.production))
+            }
+        }
+    }
+
+    private func label(_ s: String) -> some View { Text(s).foregroundStyle(.secondary).gridColumnAlignment(.trailing) }
+
+    /// Labels right-aligned in one column, fields in the other; long explanations live in tooltips.
+    private var fields: some View {
+        Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
+            GridRow {
+                label("Type")
+                Picker("Type", selection: $draft.kind) {
+                    ForEach([Conn.Kind.postgres, .mysql, .sqlite, .redis], id: \.self) { Label($0.shortName, systemImage: $0.icon).tag($0) }
+                }
+                .labelsHidden().frame(width: 300, alignment: .leading)
+            }
+            if draft.kind == .sqlite {
+                GridRow {
+                    label("File")
+                    HStack {
+                        TextField("File", text: $draft.path, prompt: Text("/path/to/database.sqlite")).labelsHidden().selectAllOnFocus()
+                        Button("Choose…") { pickFile() }
+                    }
+                }
+            } else {
+                GridRow {
+                    label("Host")
+                    HStack(spacing: 8) {
+                        TextField("Host", text: $draft.host, prompt: Text("localhost")).labelsHidden().selectAllOnFocus()
+                        Text("Port").foregroundStyle(.secondary)
+                        TextField("Port", text: $draft.port, prompt: Text(draft.kind.defaults.port)).labelsHidden().selectAllOnFocus().frame(width: 70)
+                    }
+                }
+                GridRow {
+                    label(draft.kind == .redis ? "User (ACL)" : "User")
+                    TextField("User", text: $draft.user, prompt: Text(draft.kind == .redis ? "optional" : draft.kind.defaults.user))
+                        .labelsHidden().selectAllOnFocus()
+                }
+                GridRow {
+                    label("Password")
+                    SecureField("Password", text: Binding(get: { draft.password ?? "" }, set: { draft.password = $0.isEmpty ? nil : $0 }),
+                                prompt: Text("none")).labelsHidden().selectAllOnFocus()
+                }
+                GridRow {
+                    label(draft.kind == .redis ? "DB index" : "Database")
+                    TextField("Database", text: $draft.database, prompt: Text(draft.kind == .redis ? "0" : "optional")).labelsHidden().selectAllOnFocus()
+                }
+                GridRow { Divider().gridCellColumns(2) }
+                GridRow {
+                    label("TLS / SSL")
+                    HStack {
+                        Picker("TLS / SSL", selection: Binding(get: { draft.tlsMode }, set: { draft.tls = $0 })) {
+                            ForEach(TLSMode.allCases.filter { draft.kind != .redis || $0 != .prefer }, id: \.self) { Text($0.title).tag($0) }
+                        }
+                        .labelsHidden().frame(width: 300, alignment: .leading)
+                        .help("Required encrypts without checking the certificate (fine for a self-signed home server). Verify also checks the certificate and host name.")
+                    }
+                }
+                if draft.kind == .postgres || draft.kind == .redis {
+                    GridRow {
+                        Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                        Toggle("Allow cleartext password", isOn: Binding(get: { draft.allowCleartextPassword ?? false },
+                                                                        set: { draft.allowCleartextPassword = $0 }))
+                            .help(draft.kind == .redis
+                                  ? "Without TLS Verify or SSH, a Redis password is only sent to localhost unless this is on."
+                                  : "Only for servers using the 'password' auth method.")
+                    }
+                }
+                if draft.kind == .mysql {
+                    GridRow {
+                        Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                        Toggle("Allow public key retrieval", isOn: Binding(get: { draft.allowPublicKeyRetrieval ?? false },
+                                                                          set: { draft.allowPublicKeyRetrieval = $0 }))
+                            .help("MySQL 8 needs it to log in without TLS Verify. Only enable on a network you trust.")
+                    }
+                }
+                GridRow {
+                    Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                    Toggle("Connect over SSH", isOn: Binding(get: { draft.useSSH ?? false }, set: { draft.useSSH = $0 }))
+                        .help("Uses your ~/.ssh config, keys and ssh-agent (no password login). Host and port above are as seen from the SSH server.")
+                }
+                if draft.useSSH == true {
+                    GridRow {
+                        label("SSH host")
+                        HStack(spacing: 8) {
+                            TextField("SSH host", text: Binding(get: { draft.sshHost ?? "" }, set: { draft.sshHost = $0 }), prompt: Text("bastion.example.com"))
+                                .labelsHidden().selectAllOnFocus()
+                            Text("Port").foregroundStyle(.secondary)
+                            TextField("SSH port", text: Binding(get: { draft.sshPort ?? "22" }, set: { draft.sshPort = $0 }), prompt: Text("22"))
+                                .labelsHidden().selectAllOnFocus().frame(width: 70)
+                        }
+                    }
+                    GridRow {
+                        label("SSH user")
+                        TextField("SSH user", text: Binding(get: { draft.sshUser ?? "" }, set: { draft.sshUser = $0 }), prompt: Text(NSUserName()))
+                            .labelsHidden().selectAllOnFocus()
+                    }
+                    GridRow {
+                        label("Key")
+                        HStack {
+                            TextField("Key", text: Binding(get: { draft.sshKey ?? "" }, set: { draft.sshKey = $0 }), prompt: Text("ssh-agent / ~/.ssh/config"))
+                                .labelsHidden()
+                            Button("Choose…") { pickKey() }
+                        }
+                    }
+                }
+            }
+            GridRow { Divider().gridCellColumns(2) }
+            GridRow {
+                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                Toggle("Production database", isOn: Binding(get: { draft.isProduction ?? false }, set: { draft.isProduction = $0 }))
+                    .help("Marks the connection in red and asks before UPDATE/DELETE without WHERE, DROP, TRUNCATE, saving edits and importing.")
+            }
+        }
+        .textFieldStyle(.roundedBorder)
+        .toggleStyle(.checkbox)
+    }
+
+    @ViewBuilder private var footer: some View {
+        HStack(spacing: 8) {
+            if connecting { ProgressView().controlSize(.small) }
+            if let error = error ?? notice {
+                Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    .lineLimit(3).textSelection(.enabled).font(.callout)
+            } else if let tested {
+                Label(tested, systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.callout)
+            }
+            Spacer()
+            Button("Test Connection") { test() }.disabled(connecting)
+            Button("Save") { save() }
+            Button("Connect") { connect() }.keyboardShortcut(.defaultAction).disabled(connecting)
+        }
+        .padding(.horizontal, 20).padding(.vertical, 12)
+    }
+
+    /// Connects with the current form, reports the server version, and disconnects.
+    func test() {
+        connecting = true; error = nil; tested = nil
+        let c = draft
+        Task {
+            defer { connecting = false }
+            do {
+                let s = try await Session.open(c)
+                tested = "Connected" + (s.serverVersion.isEmpty ? "" : " · \(s.serverVersion)")
+            } catch { self.error = error.localizedDescription }
         }
     }
 
@@ -802,6 +1001,12 @@ struct WorkspaceView: View {
                 Button("Cancel", role: .cancel) { session.pendingConfirm = nil }
             } message: { p in Text(p.details.joined(separator: "\n")) }
             .focusedSceneValue(\.renameConnection) { renaming = true }
+            .focusedSceneValue(\.newQueryTab) { session.newTab() }
+            // History lives in the sidebar tab; its shortcut still toggles it (no toolbar button).
+            .background {
+                Button("Query History") { withAnimation { columns = .all; sidebarTab = sidebarTab == .history ? .items : .history } }
+                    .shortcut(.history).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+            }
             .focusedSceneValue(\.switchDatabase, session.databases.isEmpty ? nil : {
                 // The switcher lives in the sidebar: show it first, then open the picker.
                 withAnimation { columns = .all }
@@ -825,33 +1030,33 @@ struct WorkspaceView: View {
             Spacer() // flexible space in a macOS toolbar: pushes the actions to the trailing edge
             if session.busy && session.conn.kind != .redis && session.conn.kind != .mysql {
                 Button { session.cancel() } label: { Label("Stop", systemImage: "stop.fill") }
-                    .keyboardShortcut(".", modifiers: .command)
+                    .shortcut(.stop)
+                    .help("Stop query (\(Keymap.shared.display(.stop)))")
             } else {
                 Button { session.run() } label: { Label("Run", systemImage: "play.fill") }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(session.busy || session.kind != .data)
+                    .shortcut(.run)
+                    .help("Run query (\(Keymap.shared.display(.run)))")
+                    .disabled(session.busy || session.kind != .data || session.sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            Button { withAnimation { columns = .all; sidebarTab = sidebarTab == .history ? .items : .history } } label: {
-                Label("History", systemImage: "clock.arrow.circlepath")
-            }
-            .keyboardShortcut("y", modifiers: .command)
             Button { withAnimation { showEditor.toggle() } } label: { Label("SQL Editor", systemImage: "rectangle.topthird.inset.filled") }
-                .keyboardShortcut("e", modifiers: [.command, .shift])
-                .help("Show/hide SQL editor (⇧⌘E)")
+                .shortcut(.toggleEditor)
+                .help("Show/hide SQL editor (\(Keymap.shared.display(.toggleEditor)))")
             if session.conn.kind != .sqlite {
                 Button { showProcesses = true } label: { Label("Processes", systemImage: "person.2") }
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .shortcut(.processes)
+                    .help("Server processes: see and kill client connections (\(Keymap.shared.display(.processes)))")
             }
             Button { close() } label: { Label("Disconnect", systemImage: "eject") }
+                .help("Disconnect")
             NewTabButton()
             Button { withAnimation { columns = columns == .detailOnly ? .all : .detailOnly } } label: {
                 Label("Sidebar", systemImage: "sidebar.left")
             }
-            .keyboardShortcut("b", modifiers: .command)
-            .help("Show/hide tables (⌘B)")
+            .shortcut(.toggleSidebar)
+            .help("Show/hide tables (\(Keymap.shared.display(.toggleSidebar)))")
             Button { showDetails.toggle() } label: { Label("Details", systemImage: "sidebar.right") }
-                .keyboardShortcut("b", modifiers: [.command, .option])
-                .help("Show/hide row details (⌥⌘B)")
+                .shortcut(.toggleDetails)
+                .help("Show/hide row details (\(Keymap.shared.display(.toggleDetails)))")
           }
         }
         .modifier(HideToolbarTitle()) // the ConnectionTitle replaces it; the window title still names the tab
@@ -1218,7 +1423,7 @@ struct DatabaseSwitcher: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Switch database (⌘K)")
+        .help("Switch database (\(Keymap.shared.display(.switchDatabase)))")
         .background(GeometryReader { g in Color.clear.onAppear { buttonHeight = g.size.height } })
         // A dropdown hanging from the button, exactly as wide as it (not a popover).
         .overlay(alignment: .top) {
@@ -1243,7 +1448,7 @@ struct SaveBar: View {
             Button { session.saveAll() } label: {
                 if session.saving { ProgressView().controlSize(.small) } else { Text("Save") }
             }
-            .keyboardShortcut("s", modifiers: .command)
+            .shortcut(.save)
             .buttonStyle(.borderedProminent)
             .disabled(session.saving)
             .help("Save changes (⌘S)")
@@ -1291,6 +1496,7 @@ final class GridCell: NSTextFieldCell {
 
 struct ResultGrid: NSViewRepresentable {
     let result: QueryResult
+    @AppStorage(Prefs.gridFontKey) private var fontSize = 12 // re-renders when changed in Settings
     var selection: Binding<Int?> = .constant(nil)
     var edits: [Int: [Int: String?]] = [:]
     var editable = false
@@ -1435,7 +1641,7 @@ struct ResultGrid: NSViewRepresentable {
         tv.gridStyleMask = .solidVerticalGridLineMask
         tv.columnAutoresizingStyle = .noColumnAutoresizing
         tv.allowsMultipleSelection = true
-        tv.rowHeight = 18
+        tv.rowHeight = Prefs.gridFontSize + 6
         tv.dataSource = context.coordinator
         tv.delegate = context.coordinator
         tv.target = context.coordinator
@@ -1473,6 +1679,12 @@ struct ResultGrid: NSViewRepresentable {
         c.isMultiMenu = isMultiMenu
         c.editsOnSingleClick = editsOnSingleClick
         guard let tv = sv.documentView as? NSTableView else { return }
+        let size = Prefs.gridFontSize
+        if tv.rowHeight != size + 6 { // font size changed in Settings
+            tv.rowHeight = size + 6
+            for col in tv.tableColumns { (col.dataCell as? NSCell)?.font = .monospacedSystemFont(ofSize: size, weight: .regular) }
+            tv.reloadData()
+        }
         if c.result.id == result.id {
             if c.edits != edits {
                 if edits.isEmpty { c.startedRows = [] } // saved or discarded: back to the normal state
@@ -1494,7 +1706,7 @@ struct ResultGrid: NSViewRepresentable {
                 col.isEditable = true // gated by shouldEdit
                 let cell = GridCell()
                 cell.isEditable = true // NSCell defaults to non-editable; shouldEdit still gates it
-                cell.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+                cell.font = .monospacedSystemFont(ofSize: Prefs.gridFontSize, weight: .regular)
                 cell.lineBreakMode = .byTruncatingTail
                 cell.truncatesLastVisibleLine = true
                 col.dataCell = cell

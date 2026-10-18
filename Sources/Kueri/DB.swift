@@ -12,10 +12,10 @@ struct QueryResult {
 }
 
 // Limitation: results capped in memory, add paging (LIMIT/OFFSET) if you need to scroll millions of rows
-let maxRows = 10_000
+var maxRows: Int { Prefs.maxRows }
 /// Rows per page when browsing a table.
 // Limitation: LIMIT/OFFSET without ORDER BY, fine for browsing; switch to keyset paging on the PK if deep pages get slow
-let pageSize = 300
+var pageSize: Int { Prefs.pageSize }
 
 protocol Database: AnyObject {
     func tables() throws -> [String]
@@ -116,8 +116,11 @@ func quoteIdent(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"",
 /// Sidebar names are display text ("users", "audit.logs"). Each is recorded with its exact
 /// (schema, name) when the table list loads, so quoting/DDL never re-splits the text on "." —
 /// a table literally named "audit.logs" in the default schema must not become audit → logs.
-struct TableNames {
+/// Thread-safe: the session queue rebuilds it while the main thread reads it (connection bar,
+/// quoting for the details popover), so every access goes through the lock.
+final class TableNames: @unchecked Sendable {
     private var exact: [String: (schema: String, name: String)] = [:]
+    private let lock = NSLock()
 
     /// Bare name in the default schema, `schema.name` elsewhere; if either part contains a dot or a
     /// quote the label is fully quoted (`"a.b"."c"`), which can't collide with any other table.
@@ -128,21 +131,22 @@ struct TableNames {
         return schema == defaultSchema ? name : schema + "." + name
     }
 
-    mutating func record(_ rows: [(schema: String, name: String)], defaultSchema: String?) -> [String] {
-        exact = [:]
+    func record(_ rows: [(schema: String, name: String)], defaultSchema: String?) -> [String] {
         var labels = rows.map { Self.display(schema: $0.schema, name: $0.name, defaultSchema: defaultSchema) }
         // Any label still shared by two tables (shouldn't happen, but never guess) gets the quoted form.
         let counts = Dictionary(labels.map { ($0, 1) }, uniquingKeysWith: +)
         for i in labels.indices where counts[labels[i]]! > 1 {
             labels[i] = quoteIdent(rows[i].schema) + "." + quoteIdent(rows[i].name)
         }
-        for (label, r) in zip(labels, rows) { exact[label] = r }
+        var map: [String: (schema: String, name: String)] = [:]
+        for (label, r) in zip(labels, rows) { map[label] = r }
+        lock.withLock { exact = map }
         return labels
     }
 
     /// Exact parts for a sidebar name; names typed by the user (not in the list) split on the first dot.
     func parts(_ display: String, defaultSchema: String?) -> (schema: String?, name: String) {
-        if let e = exact[display] { return (e.schema, e.name) }
+        if let e = lock.withLock({ exact[display] }) { return (e.schema, e.name) }
         let p = display.split(separator: ".", maxSplits: 1).map(String.init)
         return p.count == 2 ? (p[0], p[1]) : (defaultSchema, display)
     }
@@ -298,7 +302,7 @@ final class PostgresDB: Database {
     }
     deinit { PQfinish(conn) }
     private var typeNames: [UInt32: String] = [:]
-    private var names = TableNames()
+    private let names = TableNames()
 
     func tables() throws -> [String] {
         let rows = try query("""
@@ -649,6 +653,16 @@ func selfTest() {
     assert(Session.dropIndexSQL(.mysql, table: "`t`", schema: nil, name: "PRIMARY", primary: true) == ["ALTER TABLE `t` DROP PRIMARY KEY"])
     assert(ColumnType.fullName("timestamp", kind: .postgres) == "timestamp without time zone")
     assert(ColumnType.fullName("int4[]", kind: .postgres) == "integer[]" && ColumnType.fullName("varchar(255)", kind: .mysql) == "varchar(255)")
+    // Redis: unverified TLS to another host still needs the cleartext opt-in (refused before connecting).
+    assert((try? RedisDB(host: "192.0.2.1", port: "6379", user: "", password: "pw", database: "0", tls: .required)) == nil)
+    // Table names are rebuilt on the session queue while the main thread reads them: must not crash.
+    let shared = TableNames()
+    DispatchQueue.concurrentPerform(iterations: 2) { worker in
+        for i in 0..<20_000 {
+            if worker == 0 { _ = shared.record([(schema: "s\(i % 3)", name: "t\(i % 50)")], defaultSchema: "public") }
+            else { _ = shared.parts("s1.t\(i % 50)", defaultSchema: "public") }
+        }
+    }
     print("selftest ok")
 }
 

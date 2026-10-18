@@ -288,4 +288,20 @@ import SwiftUI
     ps.pendingConfirm?.action(); waitIdleOn(ps)
     ps.sql = "SELECT count(*) AS n FROM t"; ps.run(); waitIdleOn(ps)
     check("production: confirmed query runs", ps.result.rows.first?.first == "0")
+    // Keymap: default shortcuts are all different; a taken shortcut is reported as a conflict.
+    let defaults = KeyAction.allCases.map(\.defaultShortcut)
+    check("keymap: default shortcuts are unique", Set(defaults.map(\.display)).count == defaults.count)
+    let fresh = Keymap()
+    check("keymap: conflict found for a taken shortcut",
+          fresh.overrides.isEmpty ? fresh.conflict(Shortcut(key: "s", modifiers: [.command]), for: .run) == .save : true)
+    check("keymap: menu-style display", Shortcut(key: "\r", modifiers: [.command, .shift]).display == "⇧⌘↩"
+          && KeyAction.toggleDetails.defaultShortcut.display == "⌥⌘B")
+    // Theme: forcing light / dark changes what windows draw with; System follows macOS again.
+    let themed = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 50, height: 50), styleMask: [.titled], backing: .buffered, defer: false)
+    Appearance.dark.apply()
+    let dark = themed.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    Appearance.light.apply()
+    let light = themed.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .aqua
+    Appearance.system.apply()
+    check("appearance: dark and light are applied, system clears the override", dark && light && NSApp.appearance == nil)
 }

@@ -78,6 +78,7 @@ struct SQLEditor: NSViewRepresentable {
     @Binding var text: String
     let completer: SQLCompleter
     var cacheVersion = 0 // changes when columns finish loading, so the suggestion can appear right away
+    @AppStorage(Prefs.editorFontKey) private var fontSize = 13 // re-renders when changed in Settings
 
     final class TextView: NSTextView {
         var ghost: String?            // remaining characters of the suggestion, drawn after the caret
@@ -187,7 +188,7 @@ struct SQLEditor: NSViewRepresentable {
         tv.isVerticallyResizable = true
         tv.minSize = old.minSize; tv.maxSize = old.maxSize
         sv.documentView = tv
-        tv.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+        tv.font = .monospacedSystemFont(ofSize: Prefs.editorFontSize, weight: .regular)
         tv.isRichText = false
         tv.allowsUndo = true
         tv.isAutomaticQuoteSubstitutionEnabled = false
@@ -208,6 +209,7 @@ struct SQLEditor: NSViewRepresentable {
     func updateNSView(_ sv: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let tv = sv.documentView as? TextView else { return }
+        if tv.font?.pointSize != Prefs.editorFontSize { tv.font = .monospacedSystemFont(ofSize: Prefs.editorFontSize, weight: .regular) }
         let c = completer
         tv.suggest = { w, sql, before in c.best(for: w, in: sql, before: before) }
         tv.list = { w, sql, before in c.candidates(for: w, in: sql, before: before) }

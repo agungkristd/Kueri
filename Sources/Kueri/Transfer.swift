@@ -36,13 +36,14 @@ final class TransferCancel: @unchecked Sendable {
 
 enum Tools {
     /// PostgreSQL client tools, most capable first: Postgres.app and full Homebrew PostgreSQL builds
-    /// support lz4/zstd-compressed archives; Homebrew's libpq (always present for Kueri) only gzip.
+    /// support lz4/zstd-compressed archives; Homebrew's libpq and the copy bundled in a release only gzip.
     static func pgCandidates(_ name: String) -> [String] {
         var dirs = ["/Applications/Postgres.app/Contents/Versions/latest/bin"]
         for prefix in ["/opt/homebrew/opt", "/usr/local/opt"] {
             dirs += (14...18).reversed().map { "\(prefix)/postgresql@\($0)/bin" } + ["\(prefix)/postgresql/bin"]
         }
         dirs += ["/opt/homebrew/opt/libpq/bin", "/usr/local/opt/libpq/bin"]
+        dirs.append(Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers").path) // packaged release (package.sh)
         return dirs.map { "\($0)/\(name)" }.filter { FileManager.default.isExecutableFile(atPath: $0) }
     }
 

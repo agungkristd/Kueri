@@ -17,10 +17,11 @@ final class RedisDB: Database {
     init(host: String, port: String, user: String, password: String, database: String, allowCleartextPassword: Bool = false,
          tls: TLSMode = .off, via: (host: String, port: String)? = nil) throws {
         // Through an SSH tunnel the password travels encrypted, so the loopback rule doesn't apply.
-        if !password.isEmpty, !allowCleartextPassword, tls == .off, via == nil, !Self.isLoopback(host) {
+        // Unverified TLS could be a man in the middle, so only Verify (or an SSH tunnel) lifts the rule.
+        if !password.isEmpty, !allowCleartextPassword, tls != .verify, via == nil, !Self.isLoopback(host) {
             throw DBError("""
-                Without TLS the password would be sent unencrypted to \(host). Turn on TLS for this connection, \
-                or, if this server is on a network you trust, enable "Allow cleartext password".
+                Without TLS set to Verify, the password could be intercepted on the way to \(host). Use TLS "Verify" \
+                or an SSH tunnel, or, if this server is on a network you trust, enable "Allow cleartext password".
                 """)
         }
         sock = try Socket(host: via?.host ?? host, port: via?.port ?? (port.isEmpty ? "6379" : port))

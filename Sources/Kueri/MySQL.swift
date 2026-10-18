@@ -7,7 +7,7 @@ import Security
 final class MySQLDB: Database {
     private let sock: Socket
     private var seq: UInt8 = 0
-    private var names = TableNames()
+    private let names = TableNames()
     private var currentDB: String?
 
     private static let caps: UInt32 = 0x1 | 0x2 | 0x200 | 0x2000 | 0x8000 | 0x10000 | 0x20000 | 0x80000

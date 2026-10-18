@@ -1,69 +1,115 @@
-# Kueri
+<p align="center">
+  <img src="docs/logo.png" width="128" height="128" alt="Kueri">
+</p>
 
-A small, native macOS database client for PostgreSQL, MySQL/MariaDB, SQLite and Redis.
-Written in Swift with AppKit and SwiftUI. No Electron, no bundled runtimes: the app is about 3 MB
-and idles at roughly 60–85 MB of memory.
+<h1 align="center">Kueri</h1>
 
-## Features
+<p align="center">
+  A small, native macOS client for PostgreSQL, MySQL/MariaDB, SQLite and Redis.<br>
+  Swift, AppKit and SwiftUI. No Electron, no bundled runtime: a 5 MB download that idles at 60–85 MB of memory.
+</p>
 
-- **Connections:** PostgreSQL, MySQL/MariaDB, SQLite, Redis. Saved connections, one connection per
+<p align="center">
+  <a href="https://github.com/agungkristd/Kueri/releases/latest"><b>Download for macOS</b></a>
+  &nbsp;·&nbsp; macOS 14.4 or later &nbsp;·&nbsp;
+  <a href="#build-from-source">Build from source</a>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/grid-dark.png">
+  <img src="docs/grid-light.png" alt="Kueri showing a query result with the row details panel">
+</picture>
+
+## What it does
+
+### Browse and edit data
+
+- A native grid that stays fast with hundreds of columns and thousands of rows, 300 rows per page.
+- Double-click a cell to edit it; changed rows are tinted until you save them by primary key (⌘S).
+- A row details panel with JSON formatting and search.
+- Tables, structure views and diagrams open side by side in tabs; every connection gets its own
   window tab (⌘T), and tabs reconnect after a restart.
-- **Browsing:** sidebar of tables with expandable columns (type and primary key), "Open database"
-  dialog (⌘K), Postgres schema picker, 300-row pages. A bar in the toolbar shows server version,
-  connection, database and table (red for production connections).
-- **Table tabs:** open tables, structure views and diagrams side by side within a connection.
-- **Grid:** fast native grid (hundreds of columns, thousands of rows), inline editing with double-click,
-  row details panel with JSON formatting and search, edits saved by primary key (⌘S).
-- **SQL editor:** inline autocomplete for keywords, tables and columns (Tab to accept, ⌥Esc for the list).
-  Can be hidden with ⇧⌘E.
-- **Structure and diagrams:** column structure per table, and a foreign-key diagram of a table and its
-  related tables, or of the whole database (current schema, up to 150 tables) from the sidebar's
-  Diagram tab. Click to select a table, drag it to move it, double-click or right-click for its details,
-  where columns can be edited (name, type, NULL, default) or deleted. Drag empty space to scroll;
-  zoom with ⌃-scroll, pinch or ⌘= / ⌘− / ⌘0; ⇧-scroll scrolls sideways.
-- **Server processes (⇧⌘P):** client connections on PostgreSQL, MySQL/MariaDB and Redis, refreshed
-  every 2 seconds; cancel a running query or kill a connection (Kueri's own one is protected).
-- **Table actions:** open in new tab, copy name, clone, truncate, delete. Destructive actions require
-  typing the table name.
-- **Templates:** create database, table, view, materialized view, function/procedure and schema.
-- **Query history:** a sidebar tab per connection and database, grouped by day (⌘Y).
-- **Security:** TLS for all server types (Off / Prefer / Required / Verify), SSH tunnels through the
-  system `ssh` (keys and ssh-agent; no password login), and a production mode that asks before
-  queries without WHERE, DROP, TRUNCATE, saves and imports.
-- **Export / import:** whole database, schema only or data only:
-  - PostgreSQL uses `pg_dump` / `psql` / `pg_restore`, in every pg_dump format: SQL (`.sql`),
-    custom (`.dump`, `.bak`), tar (`.tar`) and directory (a folder). Imports read the format from the
-    file itself, so a `.backup` or a renamed archive works too. Dumps move between server versions
-    in both directions (tested 12 ↔ 17); settings an older server doesn't know are skipped.
-    TimescaleDB dumps are restored in TimescaleDB's restore mode when the target has the extension,
-    and refused before any change when it doesn't.
-  - MySQL/MariaDB uses a built-in dumper (tested MySQL 8.4 → MariaDB 11).
-  - SQLite uses `sqlite3` (`.dump`, or `.backup` for `.bak`).
-  - An import that has failed statements reports them, grouped, instead of reporting success.
+- A connection bar shows server version, connection, database and table, in red for production.
 
-## Requirements
+### Write queries
 
-- macOS 14.4 or later
-- Xcode Command Line Tools (Swift 5.9+)
-- `libpq` and `openssl@3` from Homebrew: `brew install libpq openssl@3`
-- Optional: a full PostgreSQL client (for example Postgres.app) to import dumps compressed with
-  zstd or lz4; Homebrew's libpq only reads gzip-compressed archives.
+- SQL editor with inline completion for keywords, tables and columns (Tab accepts, ⌥Esc lists them).
+- Query history per connection and database, grouped by day, in the sidebar (⌘Y).
+- Templates for databases, tables, views, materialized views, functions and schemas.
 
-MySQL/MariaDB and Redis use built-in protocol implementations, so they need no client libraries.
+### See the schema
 
-## Build
+<img src="docs/diagram-dark.png" alt="Diagram of a whole database">
+
+- A foreign-key diagram of one table and its neighbours, or of the whole database from the
+  sidebar's Diagram tab. Drag tables to arrange them, drag empty space to scroll, zoom with
+  ⌃-scroll, pinch or ⌘= / ⌘− / ⌘0.
+- Double-click or right-click a table for its details:
+
+<p align="center"><img src="docs/details-dark.png" width="600" alt="Table details with staged column edits"></p>
+
+- Columns and indexes are edited in the grid like a spreadsheet: add a row, rename, pick the type,
+  NULL, algorithm or index columns from a menu, delete. Nothing runs until you save, and the SQL is
+  shown first. SQLite can only rename existing columns.
+
+### Move data
+
+- Export a whole database, its structure or its data; import into the same or another server:
+  - **PostgreSQL** in every pg_dump format: SQL (`.sql`), custom (`.dump`, `.bak`), tar (`.tar`) and
+    directory. The format is read from the file, so a `.backup` or a renamed archive works too.
+    Dumps move between server versions in both directions (tested 12 ↔ 17). TimescaleDB dumps are
+    restored in TimescaleDB's restore mode, or refused before any change when the target lacks it.
+  - **MySQL/MariaDB** with a built-in dumper (tested MySQL 8.4 → MariaDB 11).
+  - **SQLite** with `sqlite3` (`.dump`, or the database file itself as `.bak`).
+- An import with failed statements reports them, grouped, instead of reporting success.
+
+### Stay safe on servers that matter
+
+- TLS for every server type: Off, Prefer, Required (self-signed is fine) or Verify.
+- SSH tunnels through the system `ssh`, so your `~/.ssh/config`, keys and ssh-agent apply.
+- Production mode asks before UPDATE/DELETE without WHERE, DROP, TRUNCATE, saves and imports.
+- Server processes (⇧⌘P): see every client connection, cancel a query or kill a connection.
+
+### Make it yours
+
+Settings (⌘,) holds the theme (System, Light, Dark), grid and editor font sizes, rows per page,
+the result row limit, a server-side query timeout, startup behaviour, history privacy and a
+keymap where every shortcut can be changed.
+
+## Install
+
+1. Download `Kueri-<version>.dmg` from the [latest release](https://github.com/agungkristd/Kueri/releases/latest).
+2. Open it and drag **Kueri** to **Applications**.
+3. Kueri isn't notarized by Apple, so the first launch is blocked. Open **System Settings ›
+   Privacy & Security** and click **Open Anyway**, or run once:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/Kueri.app
+   ```
+
+The DMG carries everything it needs, including `pg_dump`, `pg_restore` and `psql` for PostgreSQL
+export and import. It's built for Intel Macs and runs on Apple silicon through Rosetta.
+
+## Build from source
+
+Requirements: macOS 14.4+, Xcode Command Line Tools (Swift 5.9+), and `brew install libpq openssl@3`.
+MySQL/MariaDB and Redis use built-in protocol implementations and need no client libraries.
 
 ```sh
-./build.sh                       # builds Kueri.app in this folder
+./build.sh                       # Kueri.app in this folder
 cp -R Kueri.app /Applications/   # optional
+./package.sh                     # self-contained Kueri-<version>.dmg
 ```
 
-## Checks
+For PostgreSQL archives compressed with zstd or lz4, install a full PostgreSQL client (for example
+Postgres.app); Kueri prefers it over libpq, which only reads gzip-compressed archives.
+
+### Checks
 
 ```sh
 swift build -Xcc -I"$(brew --prefix libpq)/include" -Xlinker -L"$(brew --prefix libpq)/lib" \
   -Xcc -I"$(brew --prefix openssl@3)/include" -Xlinker -L"$(brew --prefix openssl@3)/lib"
-.build/debug/Kueri --selftest    # driver and logic checks (debug build: they are asserts)
+.build/debug/Kueri --selftest            # driver and logic checks (debug build: they are asserts)
 Kueri.app/Contents/MacOS/Kueri --bench   # grid performance and UI behaviour checks
 ```
 
@@ -74,19 +120,20 @@ against a server from the command line, which is handy when working on a driver.
 
 - Saved passwords are stored unencrypted in the app's preferences file (readable only by your user
   account). The app is ad-hoc signed, and Keychain re-prompts on every rebuild of such apps.
-- For MySQL 8 servers that require full `caching_sha2_password` authentication, use TLS "Verify", or
+- For MySQL 8 servers that require full `caching_sha2_password` authentication, use TLS Verify, or
   enable "Allow public key retrieval" on the connection. It is off by default, because without a
   verified certificate the password or the server's key could be intercepted on the network.
-- SQL files are imported with `psql` in restricted mode and `sqlite3 -safe`, so meta-commands in a
-  file (`\!`, `.shell`, …) are refused and reported as errors.
 - PostgreSQL refuses servers that ask for the password in clear text (`require_auth=!password`);
   scram, md5 and trust work as usual. Enable "Allow cleartext password" only for servers that use the
   `password` auth method on a trusted network.
-- Without TLS or an SSH tunnel, Redis passwords are only sent to localhost. For a server elsewhere on
-  a trusted network, enable "Allow cleartext password".
+- Without TLS Verify or an SSH tunnel, Redis passwords are only sent to localhost. For a server
+  elsewhere on a trusted network, enable "Allow cleartext password".
+- SQL files are imported with `psql` in restricted mode and `sqlite3 -safe`, so meta-commands in a
+  file (`\!`, `.shell`, …) are refused and reported as errors.
 - TimescaleDB restores need the same TimescaleDB version on the target as on the source server.
 - Queries that mention passwords or authentication (`password`, `AUTH`, `IDENTIFIED BY`, …) are
   not saved to the query history.
-- Result sets are capped at 10,000 rows in memory. Postgres streams rows, so large results don't
-  exhaust memory.
+- Result sets are capped in memory (10,000 rows by default, see Settings). Postgres streams rows, so
+  large results don't exhaust memory.
+- The query timeout applies to PostgreSQL and MySQL (SELECT only), not to SQLite or Redis.
 - Redis values are read-only.

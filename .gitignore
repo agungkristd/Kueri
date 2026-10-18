@@ -3,3 +3,4 @@
 *.iconset/
 .DS_Store
 .swiftpm/
+*.dmg

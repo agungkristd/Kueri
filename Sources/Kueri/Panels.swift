@@ -1,6 +1,6 @@
 import SwiftUI
 
-// MARK: Connection bar ("PostgreSQL 16.8 : local : shin_kompas_prod : public.users")
+// MARK: Connection bar ("PostgreSQL 16.8 : local : shop : public.users")
 
 struct ConnectionBar: View {
     let session: Session

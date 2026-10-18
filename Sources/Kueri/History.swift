@@ -36,7 +36,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     }
 
     func add(_ e: HistoryEntry) {
-        guard !Self.containsSecret(e.sql) else { return }
+        guard Prefs.saveHistory, !Self.containsSecret(e.sql) else { return }
         // Re-running the same query moves it to the top instead of duplicating it.
         entries.removeAll { $0.sql == e.sql && $0.connectionID == e.connectionID && $0.connection == e.connection && $0.database == e.database }
         entries.insert(e, at: 0)
@@ -45,6 +45,12 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
         io.async {
             Self.write(snapshot, to: url)
         }
+    }
+
+    func clearAll() {
+        entries = []
+        let url = url
+        io.async { Self.write([], to: url) }
     }
 
     /// Clears this connection + database's history only.
