@@ -29,13 +29,14 @@ enum Prefs {
 // MARK: Keymap
 
 enum KeyAction: String, CaseIterable, Identifiable {
-    case run, stop, save, toggleEditor, history, processes, toggleSidebar, toggleDetails, switchDatabase, newTab, renameConnection
+    case run, stop, save, filterRows, toggleEditor, history, processes, toggleSidebar, toggleDetails, switchDatabase, newTab, renameConnection
     var id: String { rawValue }
     var title: String {
         switch self {
         case .run: "Run query"
         case .stop: "Stop query"
         case .save: "Save changes"
+        case .filterRows: "Filter result rows"
         case .toggleEditor: "Show / hide SQL editor"
         case .history: "Query history"
         case .processes: "Server processes"
@@ -48,7 +49,7 @@ enum KeyAction: String, CaseIterable, Identifiable {
     }
     var group: String {
         switch self {
-        case .run, .stop, .save, .toggleEditor: "Query"
+        case .run, .stop, .save, .filterRows, .toggleEditor: "Query"
         case .history, .processes, .toggleSidebar, .toggleDetails: "View"
         case .switchDatabase, .newTab, .renameConnection: "Connection"
         }
@@ -58,6 +59,7 @@ enum KeyAction: String, CaseIterable, Identifiable {
         case .run: Shortcut(key: "\r", modifiers: [.command])
         case .stop: Shortcut(key: ".", modifiers: [.command])
         case .save: Shortcut(key: "s", modifiers: [.command])
+        case .filterRows: Shortcut(key: "f", modifiers: [.command])
         case .toggleEditor: Shortcut(key: "e", modifiers: [.command, .shift])
         case .history: Shortcut(key: "y", modifiers: [.command])
         case .processes: Shortcut(key: "p", modifiers: [.command, .shift])

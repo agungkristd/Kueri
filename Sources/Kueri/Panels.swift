@@ -32,6 +32,14 @@ struct ConnectionBar: View {
     }
 }
 
+/// Search by words: every word of the query (split on spaces, `_`, `-`, `.`) appears in the text,
+/// in any order and case. "shop local" finds `shop_local`; an empty query matches everything.
+func nameMatches(_ query: String, _ text: String) -> Bool {
+    let words = query.lowercased().split(whereSeparator: { " _-.".contains($0) })
+    let t = text.lowercased()
+    return words.allSatisfy { t.contains($0) }
+}
+
 // MARK: Database dropdown (⌘K)
 
 struct DatabaseDropdown: View {
@@ -45,7 +53,7 @@ struct DatabaseDropdown: View {
     @FocusState private var focused: Bool
 
     private var filtered: [String] {
-        search.isEmpty ? session.databases : session.databases.filter { $0.localizedCaseInsensitiveContains(search) }
+        session.databases.filter { nameMatches(search, $0) }
     }
 
     var body: some View {
@@ -66,6 +74,9 @@ struct DatabaseDropdown: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(filtered, id: \.self) { db in row(db).id(db) }
+                        if filtered.isEmpty {
+                            Text("No databases match “\(search)”").foregroundStyle(.secondary).padding(.vertical, 10)
+                        }
                     }
                     .padding(4)
                 }
@@ -137,7 +148,7 @@ struct HistorySidebar: View {
     private var mine: [HistoryEntry] {
         history.entries.filter { e in
             e.database == conn.database && (e.connectionID.map { $0 == conn.id } ?? (e.connection == conn.name))
-                && (search.isEmpty || e.sql.localizedCaseInsensitiveContains(search))
+                && nameMatches(search, e.sql)
         }
     }
     private var days: [(Date, [HistoryEntry])] {

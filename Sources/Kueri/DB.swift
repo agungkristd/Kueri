@@ -663,6 +663,21 @@ func selfTest() {
             else { _ = shared.parts("s1.t\(i % 50)", defaultSchema: "public") }
         }
     }
+    // Name search: words in any order and case, separators ignored.
+    assert(nameMatches("shop local", "shop_local") && nameMatches("LOCAL sho", "shop_local_dev"))
+    assert(nameMatches("", "anything") && nameMatches("  ", "x") && !nameMatches("shop prod", "shop_local"))
+    assert(nameMatches("user.id", "users_id_seq"))
+    // Editor colours: keyword, quoted identifier, string, number, type, comment.
+    let hl = SQLHighlighter.ranges("SELECT \"id\", 'a''b' FROM t WHERE n = 42 -- note\nCREATE TABLE x (id bigserial)" as NSString)
+    let kinds = hl.map { $0.1 }
+    assert(kinds.filter { $0 == SQLHighlighter.keyword }.count == 5, "\(hl)")
+    assert(kinds.contains(SQLHighlighter.identifier) && kinds.contains(SQLHighlighter.number) && kinds.contains(SQLHighlighter.type))
+    assert(hl.contains { $0.1 == SQLHighlighter.string && $0.0.length == 6 } && hl.contains { $0.1 == SQLHighlighter.comment })
+    // Result filter: every word somewhere in the row, any case; nil when empty.
+    let fr = QueryResult(columns: ["id", "name"], rows: [["1", "Class 1-A"], ["2", "Kelas 1"], ["3", nil]])
+    assert(ResultGrid.matching(fr, "") == nil && ResultGrid.matching(fr, "class 1-a") == [0] && ResultGrid.matching(fr, "1") == [0, 1])
+    assert(Session.isLocalNetwork("192.168.1.20") && Session.isLocalNetwork("nas.local") && Session.isLocalNetwork("172.20.0.5"))
+    assert(!Session.isLocalNetwork("172.40.0.1") && !Session.isLocalNetwork("db.example.com") && !Session.isLocalNetwork("8.8.8.8"))
     print("selftest ok")
 }
 

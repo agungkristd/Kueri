@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 // MARK: Saved connections, passwords included, in UserDefaults
 // (~/Library/Preferences/local.kueri.plist, mode 0600). Not Keychain on purpose: with
@@ -115,6 +116,30 @@ enum LegacyMigration {
     }
 
     /// Connects and loads the sidebar lists, off the main thread.
+    /// Right after launch macOS can refuse LAN connections ("No route to host") while it checks the
+    /// Local Network permission, even when it's granted; the same connection works seconds later.
+    private static func connectRetryingLocal(_ c: Conn) async throws
+        -> (Database, tables: [String], databases: [String], schemas: [String], tunnel: SSHTunnel?, version: String) {
+        var attempt = 0
+        while true {
+            do { return try await connect(c) }
+            catch where attempt < 3 && isLocalNetwork(c.host) && error.localizedDescription.contains("No route to host") {
+                attempt += 1
+                log.notice("LAN connect to \(c.host, privacy: .public) refused, retry \(attempt)")
+                try await Task.sleep(for: .milliseconds(700 * attempt))
+            }
+        }
+    }
+    private static let log = Logger(subsystem: "app.kueri", category: "connect")
+
+    /// Private / link-local addresses and .local names: what macOS's Local Network permission covers.
+    nonisolated static func isLocalNetwork(_ host: String) -> Bool {
+        let h = host.lowercased()
+        if h.hasSuffix(".local") || h.hasPrefix("10.") || h.hasPrefix("192.168.") || h.hasPrefix("169.254.") { return true }
+        let p = h.split(separator: ".").compactMap { Int($0) }
+        return p.count == 4 && p[0] == 172 && (16...31).contains(p[1])
+    }
+
     /// Connects (through an SSH tunnel when configured; an existing tunnel is reused when switching
     /// databases) and loads the sidebar lists, off the main thread.
     private static func connect(_ c: Conn, tunnel existing: SSHTunnel? = nil) async throws
@@ -150,7 +175,16 @@ enum LegacyMigration {
     }
 
     static func open(_ c: Conn) async throws -> Session {
-        let (db, tables, databases, schemas, tunnel, version) = try await connect(c)
+        let (db, tables, databases, schemas, tunnel, version): (Database, [String], [String], [String], SSHTunnel?, String)
+        do { (db, tables, databases, schemas, tunnel, version) = try await connectRetryingLocal(c) }
+        catch where Self.isLocalNetwork(c.host) && error.localizedDescription.contains("No route to host") {
+            // macOS blocks the LAN until Kueri is allowed; it reports that as "No route to host".
+            // The hint goes first: error labels show only the first lines.
+            throw DBError("""
+                macOS is blocking Kueri from the local network. Turn on Kueri in System Settings › Privacy & Security › \
+                Local Network (off and on again if it's already on), then connect again.\n\n
+                """ + error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         let s = Session(conn: c, db: db)
         s.tunnel = tunnel
         s.serverVersion = version
@@ -593,6 +627,8 @@ struct ConnectionsView: View {
                         .buttonStyle(.borderless)
                         .help("Delete \(c.name)")
                 }
+                // Every other row slightly shaded, like the grid, so long lists stay easy to follow.
+                .listRowBackground(rowBackground(c))
             }
             .contextMenu(forSelectionType: UUID.self) { ids in
                 if let c = store.conns.first(where: { ids.contains($0.id) }) {
@@ -817,6 +853,11 @@ struct ConnectionsView: View {
         }
     }
 
+    private func rowBackground(_ c: Conn) -> some View {
+        let odd = !(store.conns.firstIndex(of: c) ?? 0).isMultiple(of: 2)
+        return RoundedRectangle(cornerRadius: 6).fill(odd ? Color.primary.opacity(0.06) : .clear).padding(.horizontal, 10)
+    }
+
     func new() { draft = Conn(); selection = nil }
 
     func save() {
@@ -873,6 +914,8 @@ struct WorkspaceView: View {
     @State private var columns = NavigationSplitViewVisibility.all
     @State private var pendingAction: (action: TableAction, table: String)?
     enum SidebarTab { case items, diagram, history }
+    @State private var rowFilter = ""
+    @FocusState private var filterFocused: Bool
     @State private var sidebarTab = SidebarTab.items
     @State private var pendingSchema = false
     @State private var pendingDatabase = false
@@ -913,7 +956,7 @@ struct WorkspaceView: View {
                 TextField(session.conn.kind == .redis ? "Filter keys" : "Filter tables", text: $filter)
                     .textFieldStyle(.roundedBorder)
                     .padding(.horizontal, 10).padding(.vertical, 8)
-                SidebarList(items: session.visibleTables.filter { filter.isEmpty || $0.localizedCaseInsensitiveContains(filter) },
+                SidebarList(items: session.visibleTables.filter { nameMatches(filter, $0) },
                             stripPrefix: session.schemaPrefix,
                             icon: session.conn.kind == .redis ? "key" : "tablecells",
                             expandable: session.conn.kind != .redis,
@@ -964,10 +1007,27 @@ struct WorkspaceView: View {
                     }
                     ResultGrid(result: session.result, selection: $session.selectedRow, edits: session.edits,
                                editable: session.readOnlyReason == nil,
-                               onEdit: { r, c, v in session.setEdit(row: r, column: c, value: v) })
+                               onEdit: { r, c, v in session.setEdit(row: r, column: c, value: v) },
+                               filter: rowFilter)
                     if session.editCount > 0 { SaveBar(session: session) }
                     HStack {
-                        if !session.canPage || !session.result.message.isEmpty {
+                        // Filters the rows already loaded (this page / result), without running a new query.
+                        HStack(spacing: 4) {
+                            Image(systemName: "line.3.horizontal.decrease").foregroundStyle(rowFilter.isEmpty ? .secondary : Color.accentColor)
+                            TextField("Filter rows", text: $rowFilter).textFieldStyle(.plain).focused($filterFocused)
+                                .onExitCommand { rowFilter = ""; filterFocused = false }
+                            if !rowFilter.isEmpty {
+                                Button { rowFilter = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.borderless)
+                            }
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(.quaternary.opacity(0.5)))
+                        .frame(maxWidth: 260)
+                        .help("Filter the loaded rows by any cell (\(Keymap.shared.display(.filterRows))). Esc clears.")
+                        if !rowFilter.isEmpty {
+                            let n = ResultGrid.matching(session.result, rowFilter)?.count ?? session.result.rows.count
+                            Text("\(n) of \(session.result.rows.count) rows").monospacedDigit()
+                        } else if !session.canPage || !session.result.message.isEmpty {
                             Text(session.result.message.isEmpty ? "\(session.result.rows.count) row(s)" : session.result.message)
                         }
                         Spacer()
@@ -1007,6 +1067,11 @@ struct WorkspaceView: View {
             .focusedSceneValue(\.renameConnection) { renaming = true }
             .focusedSceneValue(\.newQueryTab) { session.newTab() }
             // History lives in the sidebar tab; its shortcut still toggles it (no toolbar button).
+            .onChange(of: session.table) { rowFilter = "" } // another table: start unfiltered
+            .background {
+                Button("Filter Rows") { filterFocused = true }
+                    .shortcut(.filterRows).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+            }
             .background {
                 Button("Query History") { withAnimation { columns = .all; sidebarTab = sidebarTab == .history ? .items : .history } }
                     .shortcut(.history).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
@@ -1509,6 +1574,9 @@ struct ResultGrid: NSViewRepresentable {
     var editableCell: ((Int, Int) -> Bool)? = nil
     /// Starts editing this cell once (e.g. the name of a row just added); a new id asks again.
     var editRequest: GridEditRequest? = nil
+    /// Shows only rows whose cells contain every word (any order and case); edits and selection still
+    /// refer to rows of `result`.
+    var filter = ""
     var onDoubleClick: (Int, Int) -> Void = { _, _ in }
     /// Cells edited by picking from a menu (double-click shows it on the cell); nil = not a menu cell.
     var menuForCell: (Int, Int) -> [String]? = { _, _ in nil }
@@ -1530,6 +1598,11 @@ struct ResultGrid: NSViewRepresentable {
         var menuForCell: (Int, Int) -> [String]? = { _, _ in nil }
         var isMultiMenu: (Int, Int) -> Bool = { _, _ in false }
         var editsOnSingleClick: (Int) -> Bool = { _ in false }
+        var filter = ""
+        /// Displayed row → row of `result` while filtering (nil = all rows, same index).
+        var visible: [Int]?
+        func src(_ row: Int) -> Int { visible.map { row < $0.count ? $0[row] : row } ?? row }
+        func display(_ source: Int) -> Int? { visible.map { $0.firstIndex(of: source) } ?? source }
         /// Rows whose editing started here and isn't reflected in `edits` yet (typing hasn't been committed).
         var startedRows: Set<Int> = []
         static let editTint = NSColor.systemOrange.withAlphaComponent(0.13)
@@ -1537,9 +1610,10 @@ struct ResultGrid: NSViewRepresentable {
         /// Rows in an edit state: tinted, and a single click edits their cells.
         func inEditState(_ row: Int) -> Bool { editsOnSingleClick(row) || startedRows.contains(row) }
 
+        /// `row` is a displayed row; the started set keeps rows of `result`.
         func markStarted(_ row: Int, in tv: NSTableView) {
-            guard !inEditState(row) else { return }
-            startedRows.insert(row)
+            guard !inEditState(src(row)) else { return }
+            startedRows.insert(src(row))
             tv.setNeedsDisplay(tv.rect(ofRow: row))
         }
         private struct Pick { let row: Int, column: Int, value: String }
@@ -1563,11 +1637,11 @@ struct ResultGrid: NSViewRepresentable {
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
         ])
 
-        func numberOfRows(in tableView: NSTableView) -> Int { result.rows.count }
+        func numberOfRows(in tableView: NSTableView) -> Int { visible?.count ?? result.rows.count }
 
         func tableViewSelectionDidChange(_ n: Notification) {
             guard let tv = n.object as? NSTableView else { return }
-            let row = tv.selectedRow >= 0 ? tv.selectedRow : nil
+            let row = tv.selectedRow >= 0 ? src(tv.selectedRow) : nil
             // Deferred: updating SwiftUI state inside NSTableView's own event handling re-enters
             // the table (AppKit "reentrant operation" warning) and can cancel a starting cell edit.
             DispatchQueue.main.async { [selection] in
@@ -1577,40 +1651,41 @@ struct ResultGrid: NSViewRepresentable {
 
         func tableView(_ tv: NSTableView, willDisplayCell cell: Any, for column: NSTableColumn?, row: Int) {
             guard let cell = cell as? GridCell, let i = column.flatMap({ Int($0.identifier.rawValue) }) else { return }
-            cell.showsMenuIndicator = menuForCell(row, i) != nil
+            cell.showsMenuIndicator = menuForCell(src(row), i) != nil
 
         }
 
-        func tableView(_ tv: NSTableView, objectValueFor column: NSTableColumn?, row: Int) -> Any? {
+        func tableView(_ tv: NSTableView, objectValueFor column: NSTableColumn?, row shown: Int) -> Any? {
+            let row = src(shown)
             guard let column, let i = Int(column.identifier.rawValue), row < result.rows.count, i < result.rows[row].count else { return nil }
             if let e = edits[row]?[i] { return Self.edited(e) }
             return result.rows[row][i] ?? Self.null
         }
 
         // Return edits the selected cell; double-click is handled explicitly below.
-        func tableView(_ tv: NSTableView, shouldEdit column: NSTableColumn?, row: Int) -> Bool { canEdit(column, row: row) }
+        func tableView(_ tv: NSTableView, shouldEdit column: NSTableColumn?, row: Int) -> Bool { canEdit(column, row: src(row)) }
 
         @objc func clicked(_ tv: NSTableView) {
-            guard tv.clickedRow >= 0, tv.clickedColumn >= 0, inEditState(tv.clickedRow) else { return }
-            let column = tv.tableColumns[tv.clickedColumn]
+            guard tv.clickedRow >= 0, tv.clickedColumn >= 0, inEditState(src(tv.clickedRow)) else { return }
+            let column = tv.tableColumns[tv.clickedColumn], r = src(tv.clickedRow)
             // Only cells that edit or have a menu; a click elsewhere just selects.
-            guard let i = Int(column.identifier.rawValue), menuForCell(tv.clickedRow, i) != nil || canEdit(column, row: tv.clickedRow) else { return }
+            guard let i = Int(column.identifier.rawValue), menuForCell(r, i) != nil || canEdit(column, row: r) else { return }
             doubleClicked(tv)
         }
 
         @objc func doubleClicked(_ tv: NSTableView) {
             guard tv.clickedRow >= 0, tv.clickedColumn >= 0 else { return }
-            let column = tv.tableColumns[tv.clickedColumn]
-            if let i = Int(column.identifier.rawValue), let items = menuForCell(tv.clickedRow, i) {
-                let current = edits[tv.clickedRow]?[i] ?? result.rows[tv.clickedRow][i]
-                let multi = isMultiMenu(tv.clickedRow, i)
+            let column = tv.tableColumns[tv.clickedColumn], r = src(tv.clickedRow)
+            if let i = Int(column.identifier.rawValue), let items = menuForCell(r, i) {
+                let current = edits[r]?[i] ?? result.rows[r][i]
+                let multi = isMultiMenu(r, i)
                 let ticked = Set((current ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
                 let menu = NSMenu()
                 var selected: NSMenuItem?
                 for v in items {
                     let mi = NSMenuItem(title: v, action: #selector(menuPicked(_:)), keyEquivalent: "")
                     mi.target = self
-                    mi.representedObject = Pick(row: tv.clickedRow, column: i, value: v)
+                    mi.representedObject = Pick(row: r, column: i, value: v)
                     if multi ? ticked.contains(v) : v == current { mi.state = .on; selected = selected ?? mi }
                     menu.addItem(mi)
                 }
@@ -1618,14 +1693,15 @@ struct ResultGrid: NSViewRepresentable {
                 let cell = tv.frameOfCell(atColumn: tv.clickedColumn, row: tv.clickedRow)
                 markStarted(tv.clickedRow, in: tv)
                 menu.popUp(positioning: multi ? nil : selected, at: NSPoint(x: cell.minX, y: cell.maxY - 2), in: tv)
-            } else if canEdit(column, row: tv.clickedRow) {
+            } else if canEdit(column, row: r) {
                 markStarted(tv.clickedRow, in: tv)
                 tv.editColumn(tv.clickedColumn, row: tv.clickedRow, with: nil, select: true)
             }
-            else if let i = Int(column.identifier.rawValue) { onDoubleClick(tv.clickedRow, i) }
+            else if let i = Int(column.identifier.rawValue) { onDoubleClick(r, i) }
         }
 
-        func tableView(_ tv: NSTableView, setObjectValue value: Any?, for column: NSTableColumn?, row: Int) {
+        func tableView(_ tv: NSTableView, setObjectValue value: Any?, for column: NSTableColumn?, row shown: Int) {
+            let row = src(shown)
             guard let column, let i = Int(column.identifier.rawValue), row < result.rows.count else { return }
             let text = (value as? NSAttributedString)?.string ?? value as? String ?? ""
             let current = edits[row]?[i] ?? result.rows[row][i]
@@ -1636,9 +1712,19 @@ struct ResultGrid: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    /// Rows containing every word of `filter` somewhere in their cells; nil when not filtering.
+    static func matching(_ r: QueryResult, _ filter: String) -> [Int]? {
+        let words = filter.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty else { return nil }
+        return r.rows.indices.filter { i in
+            let text = r.rows[i].compactMap { $0?.lowercased() }.joined(separator: "\u{1}")
+            return words.allSatisfy { text.contains($0) }
+        }
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
         let tv = GridTable()
-        tv.isTinted = { [weak c = context.coordinator] row in c?.inEditState(row) ?? false }
+        tv.isTinted = { [weak c = context.coordinator] row in c.map { $0.inEditState($0.src(row)) } ?? false }
         tv.style = .plain
         tv.focusRingType = .none // selection highlight is enough; the ring framed the whole grid
         tv.usesAlternatingRowBackgroundColors = true
@@ -1690,6 +1776,7 @@ struct ResultGrid: NSViewRepresentable {
             tv.reloadData()
         }
         if c.result.id == result.id {
+            if c.filter != filter { c.filter = filter; c.visible = Self.matching(result, filter); tv.deselectAll(nil); tv.reloadData() }
             if c.edits != edits {
                 if edits.isEmpty { c.startedRows = [] } // saved or discarded: back to the normal state
                 c.edits = edits; tv.reloadData()  // cheap for cell-based tables
@@ -1721,6 +1808,8 @@ struct ResultGrid: NSViewRepresentable {
             }
         }
         c.result = result
+        c.filter = filter
+        c.visible = Self.matching(result, filter)
         tv.reloadData()
         tv.scrollRowToVisible(0)
     }

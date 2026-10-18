@@ -3,6 +3,18 @@
 Versions follow [Semantic Versioning](https://semver.org). Release builds are attached to the
 [GitHub releases](https://github.com/agungkristd/Kueri/releases) with their SHA-256 checksum.
 
+## 1.1.2
+
+- Open source under the MIT License; the DMG now includes the license texts of the libraries it
+  bundles (THIRD_PARTY_NOTICES.md).
+- Filter the rows of a result (⌘F) without running a new query; edits still go to the right row.
+- Syntax colours in the SQL editor.
+- Database, table and history search by words in any order ("shop local" finds `shop_local`).
+- Alternating rows in the connection list.
+- Builds are signed with a stable identity when available, so macOS keeps the Local Network
+  permission across updates; LAN connections refused right after launch are retried, and the
+  error says what to allow when macOS blocks them.
+
 ## 1.1.1
 
 - The connection form fills the window: header on top, fields below, actions along the bottom edge.

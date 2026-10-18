@@ -101,6 +101,11 @@ cp -R Kueri.app /Applications/   # optional
 ./package.sh                     # self-contained Kueri-<version>.dmg
 ```
 
+`build.sh` signs with a code signing identity named "Kueri Local Signing" when your keychain has
+one (Keychain Access › Certificate Assistant › Create a Certificate…, type Code Signing), or with
+`KUERI_SIGN_IDENTITY`; otherwise ad-hoc. A stable identity keeps macOS permissions such as Local
+Network across rebuilds; with ad-hoc signing every build is a new app to macOS.
+
 For PostgreSQL archives compressed with zstd or lz4, install a full PostgreSQL client (for example
 Postgres.app); Kueri prefers it over libpq, which only reads gzip-compressed archives.
 
@@ -115,6 +120,12 @@ Kueri.app/Contents/MacOS/Kueri --bench   # grid performance and UI behaviour che
 
 `--probe <sqlite|postgres|mysql|redis> host port user password database "query"` runs a query
 against a server from the command line, which is handy when working on a driver.
+
+## License
+
+Kueri is open source under the [MIT License](LICENSE). The release DMG also contains libpq and the
+PostgreSQL client tools, OpenSSL and MIT Kerberos under their own permissive licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Limitations
 

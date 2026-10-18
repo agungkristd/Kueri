@@ -288,6 +288,21 @@ import SwiftUI
     ps.pendingConfirm?.action(); waitIdleOn(ps)
     ps.sql = "SELECT count(*) AS n FROM t"; ps.run(); waitIdleOn(ps)
     check("production: confirmed query runs", ps.result.rows.first?.first == "0")
+    // Result filter in the real grid: only matching rows show, and an edit lands on the source row.
+    let fres = QueryResult(columns: ["id", "name"], rows: [["1", "alpha"], ["2", "Kelas 1"], ["3", "beta"], ["4", "kelas 2"]])
+    var edited: (Int, Int, String?)?
+    let fhost = NSHostingView(rootView: ResultGrid(result: fres, editable: true, onEdit: { edited = ($0, $1, $2) }, filter: "kelas")
+        .frame(width: 400, height: 200))
+    let fwin = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 400, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
+    fwin.contentView = fhost; fwin.orderFrontRegardless()
+    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+    if let ft = findTable(fhost), let ds = ft.dataSource as? ResultGrid.Coordinator {
+        let shown = (0..<ft.numberOfRows).map { (ds.tableView(ft, objectValueFor: ft.tableColumns[1], row: $0) as? String) ?? "" }
+        check("result filter: shows only matching rows", shown == ["Kelas 1", "kelas 2"])
+        ds.tableView(ft, setObjectValue: "Kelas 2B", for: ft.tableColumns[1], row: 1)
+        check("result filter: edit on a filtered row goes to its source row", edited?.0 == 3 && edited?.2 == "Kelas 2B")
+    } else { check("result filter: grid found", false) }
+    fwin.close()
     // Keymap: default shortcuts are all different; a taken shortcut is reported as a conflict.
     let defaults = KeyAction.allCases.map(\.defaultShortcut)
     check("keymap: default shortcuts are unique", Set(defaults.map(\.display)).count == defaults.count)
@@ -305,3 +320,4 @@ import SwiftUI
     Appearance.system.apply()
     check("appearance: dark and light are applied, system clears the override", dark && light && NSApp.appearance == nil)
 }
+

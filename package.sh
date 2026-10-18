@@ -51,9 +51,22 @@ if left: sys.exit("still linked to Homebrew: " + ", ".join(left))
 print("bundled:", ", ".join(sorted(copied)))
 PY
 
-# Inner code first, then the app (ad-hoc signature; see README for opening a downloaded copy).
-codesign -s - --force "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/"*
-codesign -s - --force "$APP"
+# License texts of everything bundled (their licenses require them with redistribution).
+SSL=$(brew --prefix openssl@3 2>/dev/null || echo /usr/local/opt/openssl@3)
+KRB=$(brew --prefix krb5 2>/dev/null || echo /usr/local/opt/krb5)
+L="$APP/Contents/Resources/Licenses"
+mkdir -p "$L"
+cp LICENSE "$L/Kueri-LICENSE.txt"
+cp THIRD_PARTY_NOTICES.md "$L/"
+cp "$PQ/COPYRIGHT" "$L/PostgreSQL-libpq-COPYRIGHT.txt"
+cp "$SSL/LICENSE.txt" "$L/OpenSSL-LICENSE.txt"
+cp "$KRB/NOTICE" "$L/MIT-Kerberos-NOTICE.txt"
+
+# Inner code first, then the app, with the same identity build.sh used (see README for opening a
+# downloaded copy: it isn't notarized).
+SIGN=${KUERI_SIGN_IDENTITY:-$(security find-identity -p codesigning 2>/dev/null | grep -q '"Kueri Local Signing"' && echo "Kueri Local Signing" || echo -)}
+codesign -s "$SIGN" --force "$APP/Contents/Frameworks/"*.dylib "$APP/Contents/Helpers/"*
+codesign -s "$SIGN" --force "$APP"
 "$APP/Contents/Helpers/psql" --version >/dev/null
 
 STAGE=$(mktemp -d)

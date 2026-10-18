@@ -19,12 +19,16 @@ cat > $APP/Contents/Info.plist <<PL
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleName</key><string>Kueri</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.1</string>
-<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>1.1.2</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Kueri connects to database servers on your local network.</string>
 </dict></plist>
 PL
-codesign -s - --force $APP
+# A stable signing identity keeps macOS permissions (Local Network) across rebuilds; ad-hoc
+# signatures change with every build. Create one with: Keychain Access › Certificate Assistant ›
+# Create a Certificate… (type: Code Signing), named "Kueri Local Signing"; or set KUERI_SIGN_IDENTITY.
+SIGN=${KUERI_SIGN_IDENTITY:-$(security find-identity -p codesigning 2>/dev/null | grep -q '"Kueri Local Signing"' && echo "Kueri Local Signing" || echo -)}
+codesign -s "$SIGN" --force $APP
 echo "Built $(pwd)/$APP ($(du -sh $APP | cut -f1))"

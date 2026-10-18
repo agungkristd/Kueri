@@ -175,6 +175,7 @@ struct SQLEditor: NSViewRepresentable {
             guard let tv = n.object as? TextView else { return }
             parent.text = tv.string
             tv.refreshGhost()
+            SQLHighlighter.apply(to: tv)
         }
     }
 
@@ -201,6 +202,7 @@ struct SQLEditor: NSViewRepresentable {
         tv.backgroundColor = .textBackgroundColor
         tv.delegate = context.coordinator
         tv.string = text
+        SQLHighlighter.apply(to: tv)
         sv.hasVerticalScroller = true
         sv.autohidesScrollers = true
         return sv
@@ -213,7 +215,7 @@ struct SQLEditor: NSViewRepresentable {
         let c = completer
         tv.suggest = { w, sql, before in c.best(for: w, in: sql, before: before) }
         tv.list = { w, sql, before in c.candidates(for: w, in: sql, before: before) }
-        if tv.string != text { tv.string = text; tv.ghost = nil; tv.pending = nil } // set from outside (sidebar click)
+        if tv.string != text { tv.string = text; tv.ghost = nil; tv.pending = nil; SQLHighlighter.apply(to: tv) } // set from outside (sidebar click)
         else if context.coordinator.seenCacheVersion != cacheVersion, tv.window?.firstResponder === tv { tv.refreshGhost() }
         context.coordinator.seenCacheVersion = cacheVersion
     }
@@ -230,5 +232,64 @@ extension Session {
             self?.columnCacheLoading.remove(table)
         }
         return nil
+    }
+}
+
+
+/// Syntax colours for the editor, applied as layout-manager temporary attributes: the text, its
+/// undo history and what gets run are untouched. Same palette as the history list.
+enum SQLHighlighter {
+    static let keyword = NSColor.systemBlue, string = NSColor.systemRed, identifier = NSColor.systemPink
+    static let number = NSColor.systemPurple, comment = NSColor.secondaryLabelColor, type = NSColor.systemTeal
+    // Limitation: re-colours the whole text on each change; fine for editor-sized SQL, skipped above 200 KB
+    static let maxLength = 200_000
+
+    private static let keywords = Set(SQLCompleter.sqlKeywords + SQLCompleter.redisCommands)
+    private static let types: Set<String> = Set(ColumnType.postgres + ColumnType.mysql + ColumnType.sqlite
+        + ["serial", "bigserial", "smallserial", "integer", "boolean", "timestamptz", "decimal", "datetime", "character", "varying", "double", "precision"])
+        .reduce(into: []) { $0.insert($1.lowercased()) }
+
+    /// Coloured ranges of `s` (UTF-16 offsets).
+    static func ranges(_ s: NSString) -> [(NSRange, NSColor)] {
+        var out: [(NSRange, NSColor)] = []
+        let n = s.length
+        var i = 0
+        func ch(_ k: Int) -> unichar { k < n ? s.character(at: k) : 0 }
+        func isWord(_ c: unichar) -> Bool { c == 95 || (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c > 127 }
+        while i < n {
+            let c = ch(i)
+            if c == 45, ch(i + 1) == 45 || c == 35 { // -- comment (and # for MySQL)
+                var j = i; while j < n, ch(j) != 10 { j += 1 }
+                out.append((NSRange(location: i, length: j - i), comment)); i = j
+            } else if c == 47, ch(i + 1) == 42 { // /* comment */
+                var j = i + 2; while j < n, !(ch(j) == 42 && ch(j + 1) == 47) { j += 1 }
+                j = min(j + 2, n)
+                out.append((NSRange(location: i, length: j - i), comment)); i = j
+            } else if c == 39 || c == 34 || c == 96 { // 'string', "identifier", `identifier`
+                var j = i + 1
+                while j < n { if ch(j) == c { if ch(j + 1) == c { j += 2; continue }; break }; j += 1 }
+                j = min(j + 1, n)
+                out.append((NSRange(location: i, length: j - i), c == 39 ? string : identifier)); i = j
+            } else if c >= 48 && c <= 57, i == 0 || !isWord(ch(i - 1)) {
+                var j = i; while j < n, (ch(j) >= 48 && ch(j) <= 57) || ch(j) == 46 { j += 1 }
+                out.append((NSRange(location: i, length: j - i), number)); i = j
+            } else if isWord(c) {
+                var j = i; while j < n, isWord(ch(j)) { j += 1 }
+                let w = s.substring(with: NSRange(location: i, length: j - i))
+                if keywords.contains(w.uppercased()) { out.append((NSRange(location: i, length: j - i), keyword)) }
+                else if types.contains(w.lowercased()) { out.append((NSRange(location: i, length: j - i), type)) }
+                i = j
+            } else { i += 1 }
+        }
+        return out
+    }
+
+    @MainActor static func apply(to tv: NSTextView) {
+        guard let lm = tv.layoutManager else { return }
+        let s = tv.string as NSString
+        let all = NSRange(location: 0, length: s.length)
+        lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: all)
+        guard s.length <= maxLength else { return }
+        for (r, color) in ranges(s) { lm.addTemporaryAttribute(.foregroundColor, value: color, forCharacterRange: r) }
     }
 }
