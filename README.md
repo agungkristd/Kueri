@@ -135,5 +135,15 @@ against a server from the command line, which is handy when working on a driver.
   not saved to the query history.
 - Result sets are capped in memory (10,000 rows by default, see Settings). Postgres streams rows, so
   large results don't exhaust memory.
-- The query timeout applies to PostgreSQL and MySQL (SELECT only), not to SQLite or Redis.
+- The query timeout applies to PostgreSQL and MySQL (SELECT only), not to SQLite or Redis, and to
+  connections opened after it's set.
 - Redis values are read-only.
+- The release DMG is built for Intel Macs (Apple silicon runs it through Rosetta) and isn't notarized,
+  so macOS asks you to allow it once (see [Install](#install)).
+- The `pg_restore` bundled in the DMG reads gzip-compressed archives only; for zstd or lz4 archives,
+  install Postgres.app or Homebrew PostgreSQL, which Kueri then prefers.
+- The whole-database diagram shows up to 150 tables (the current schema).
+- Existing indexes can be deleted but not edited in place; delete and add one instead.
+- SQLite columns can be renamed, added and deleted, but not retyped (SQLite needs the table rebuilt).
+- Server processes are listed over the tab's own connection, so the list waits while that tab is
+  running a long query (use Stop for the tab's own query).

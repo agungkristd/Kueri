@@ -612,21 +612,23 @@ struct ConnectionsView: View {
             } message: { Text("Its saved password is removed too.") }
             .navigationSplitViewColumnWidth(min: 220, ideal: 260)
         } detail: {
-            ScrollView { // only scrolls when the window is shorter than the form
-                VStack(alignment: .leading, spacing: 0) {
-                    header.padding(16)
-                    Divider()
-                    fields.padding(16)
-                    Divider()
-                    footer
+            // Fills the detail area: header on top, fields below (scrolling only if the window is short),
+            // actions in a bar along the bottom edge.
+            VStack(spacing: 0) {
+                header.padding(.horizontal, 28).padding(.vertical, 20)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Divider()
+                ScrollView {
+                    fields.frame(maxWidth: 900, alignment: .leading)
+                        .padding(.horizontal, 28).padding(.vertical, 24)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color(nsColor: .controlBackgroundColor)))
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.2)))
-                .frame(maxWidth: 560)
-                .padding(24)
-                .frame(maxWidth: .infinity)
+                Divider()
+                footer.padding(.horizontal, 8)
+                    .background(Color(nsColor: .underPageBackgroundColor).opacity(0.5))
             }
-            .background(Color(nsColor: .windowBackgroundColor))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .controlBackgroundColor))
         }
         .onChange(of: draft.kind) { old, new in
             // Only swap defaults the user hasn't customised.
@@ -669,7 +671,9 @@ struct ConnectionsView: View {
         }
     }
 
-    private func label(_ s: String) -> some View { Text(s).foregroundStyle(.secondary).gridColumnAlignment(.trailing) }
+    private func label(_ s: String) -> some View {
+        Text(s).foregroundStyle(.secondary).frame(width: 96, alignment: .trailing).gridColumnAlignment(.trailing)
+    }
 
     /// Labels right-aligned in one column, fields in the other; long explanations live in tooltips.
     private var fields: some View {
@@ -725,7 +729,7 @@ struct ConnectionsView: View {
                 }
                 if draft.kind == .postgres || draft.kind == .redis {
                     GridRow {
-                        Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                        Color.clear.frame(width: 96, height: 1)
                         Toggle("Allow cleartext password", isOn: Binding(get: { draft.allowCleartextPassword ?? false },
                                                                         set: { draft.allowCleartextPassword = $0 }))
                             .help(draft.kind == .redis
@@ -735,14 +739,14 @@ struct ConnectionsView: View {
                 }
                 if draft.kind == .mysql {
                     GridRow {
-                        Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                        Color.clear.frame(width: 96, height: 1)
                         Toggle("Allow public key retrieval", isOn: Binding(get: { draft.allowPublicKeyRetrieval ?? false },
                                                                           set: { draft.allowPublicKeyRetrieval = $0 }))
                             .help("MySQL 8 needs it to log in without TLS Verify. Only enable on a network you trust.")
                     }
                 }
                 GridRow {
-                    Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                    Color.clear.frame(width: 96, height: 1)
                     Toggle("Connect over SSH", isOn: Binding(get: { draft.useSSH ?? false }, set: { draft.useSSH = $0 }))
                         .help("Uses your ~/.ssh config, keys and ssh-agent (no password login). Host and port above are as seen from the SSH server.")
                 }
@@ -774,7 +778,7 @@ struct ConnectionsView: View {
             }
             GridRow { Divider().gridCellColumns(2) }
             GridRow {
-                Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                Color.clear.frame(width: 96, height: 1)
                 Toggle("Production database", isOn: Binding(get: { draft.isProduction ?? false }, set: { draft.isProduction = $0 }))
                     .help("Marks the connection in red and asks before UPDATE/DELETE without WHERE, DROP, TRUNCATE, saving edits and importing.")
             }
