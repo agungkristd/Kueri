@@ -25,6 +25,11 @@ struct Conn: Codable, Identifiable, Hashable {
     var password: String? // optional so connections saved before this field still decode
     var allowPublicKeyRetrieval: Bool? // MySQL caching_sha2 without TLS; nil = off
     var allowCleartextPassword: Bool?  // Postgres "password" auth / Redis AUTH to non-local hosts; nil = off
+    var isProduction: Bool?            // asks before risky queries, saves and imports
+    var tls: TLSMode?                  // nil = the default for the kind (Postgres prefer, others off)
+    var useSSH: Bool?                  // tunnel through ssh; host/port are then as seen from the SSH server
+    var sshHost: String?, sshPort: String?, sshUser: String?, sshKey: String?
+    var tlsMode: TLSMode { tls ?? (kind == .postgres ? .prefer : .off) }
 }
 
 @Observable final class Store {
@@ -83,6 +88,9 @@ enum LegacyMigration {
     var diagram: DiagramModel?
     // Column lists for autocomplete, per table of the current database.
     var history = QueryHistory.shared
+    var tunnel: SSHTunnel?   // kept alive for the session; ssh stops when the session goes away
+    var serverVersion = ""   // "PostgreSQL 16.8", shown in the connection bar
+    var pendingConfirm: PendingConfirm?   // production safety question the workspace should show
     var columnCache: [String: [ColumnInfo]] = [:]
     var columnCacheLoading: Set<String> = []
     var error: String?
@@ -99,25 +107,36 @@ enum LegacyMigration {
     }
 
     /// Connects and loads the sidebar lists, off the main thread.
-    private static func connect(_ c: Conn) async throws -> (Database, tables: [String], databases: [String], schemas: [String]) {
+    /// Connects (through an SSH tunnel when configured; an existing tunnel is reused when switching
+    /// databases) and loads the sidebar lists, off the main thread.
+    private static func connect(_ c: Conn, tunnel existing: SSHTunnel? = nil) async throws
+        -> (Database, tables: [String], databases: [String], schemas: [String], tunnel: SSHTunnel?, version: String) {
         let pw = c.password ?? ""
         return try await Task.detached {
+            var tunnel = existing
+            if c.useSSH == true, c.kind != .sqlite, tunnel == nil {
+                tunnel = try SSHTunnel(sshHost: c.sshHost ?? "", sshPort: c.sshPort ?? "22", sshUser: c.sshUser ?? "",
+                                       keyPath: c.sshKey, dbHost: c.host, dbPort: c.port.isEmpty ? c.kind.defaults.port : c.port)
+            }
+            let via = c.useSSH == true ? tunnel.map { (host: "127.0.0.1", port: String($0.localPort)) } : nil
             let db: Database = switch c.kind {
             case .sqlite: try SQLiteDB(path: c.path)
             case .postgres: try PostgresDB(host: c.host, port: c.port, user: c.user, password: pw, database: c.database,
-                                           allowCleartextPassword: c.allowCleartextPassword ?? false)
+                                           allowCleartextPassword: c.allowCleartextPassword ?? false, tls: c.tlsMode, via: via)
             case .mysql: try MySQLDB(host: c.host, port: c.port, user: c.user, password: pw, database: c.database,
-                                     allowPublicKeyRetrieval: c.allowPublicKeyRetrieval ?? false)
+                                     allowPublicKeyRetrieval: c.allowPublicKeyRetrieval ?? false, tls: c.tlsMode, via: via)
             case .redis: try RedisDB(host: c.host, port: c.port, user: c.user, password: pw, database: c.database,
-                                     allowCleartextPassword: c.allowCleartextPassword ?? false)
+                                     allowCleartextPassword: c.allowCleartextPassword ?? false, tls: c.tlsMode, via: via)
             }
-            return (db, try db.tables(), (try? db.databases()) ?? [], (try? db.schemas()) ?? [])
+            return (db, try db.tables(), (try? db.databases()) ?? [], (try? db.schemas()) ?? [], tunnel, (try? db.serverVersion()) ?? "")
         }.value
     }
 
     static func open(_ c: Conn) async throws -> Session {
-        let (db, tables, databases, schemas) = try await connect(c)
+        let (db, tables, databases, schemas, tunnel, version) = try await connect(c)
         let s = Session(conn: c, db: db)
+        s.tunnel = tunnel
+        s.serverVersion = version
         s.tables = tables
         s.databases = databases
         s.schemas = schemas
@@ -153,7 +172,7 @@ enum LegacyMigration {
         Task {
             defer { switchingTo = nil }
             do {
-                let (newDB, t, d, sc) = try await Self.connect(c)
+                let (newDB, t, d, sc, _, _) = try await Self.connect(c, tunnel: tunnel)
                 // Old connection is released once queued work holding it finishes.
                 db = newDB; conn = c; tables = t; databases = d; schemas = sc
                 schema = sc.contains("public") ? "public" : (sc.first ?? "public")
@@ -163,9 +182,18 @@ enum LegacyMigration {
         }
     }
 
-    func run(_ text: String? = nil) {
+    func run(_ text: String? = nil, confirmed: Bool = false) {
         let q = text ?? sql
         guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !busy else { return }
+        if conn.isProduction == true, !confirmed {
+            let reasons = riskyReasons(q, kind: conn.kind)
+            if !reasons.isEmpty {
+                pendingConfirm = PendingConfirm(title: "Run this on production \(conn.name)?", details: reasons, button: "Run on Production") { [weak self] in
+                    self?.run(q, confirmed: true)
+                }
+                return
+            }
+        }
         // A new result would silently drop unsaved edits.
         guard edits.isEmpty else { error = "Save or discard \(editCount) unsaved change(s) first."; return }
         busy = true; error = nil
@@ -220,8 +248,15 @@ enum LegacyMigration {
     }
 
     /// Saves every edited row (one UPDATE per row). Rows that fail keep their edits.
-    func saveAll() {
+    func saveAll(confirmed: Bool = false) {
         guard !saving, !edits.isEmpty else { return }
+        if conn.isProduction == true, !confirmed {
+            pendingConfirm = PendingConfirm(title: "Save \(editCount) change(s) to production \(conn.name)?",
+                                            details: ["Rows are updated by primary key in \(table ?? "this table")."], button: "Save to Production") { [weak self] in
+                self?.saveAll(confirmed: true)
+            }
+            return
+        }
         saving = true; error = nil
         Task {
             defer { saving = false }
@@ -282,6 +317,9 @@ enum LegacyMigration {
     init() {
         let a = CommandLine.arguments
         ToolbarTooltips.install()
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            SSHTunnel.terminateAll()
+        }
         if a.contains("--selftest") { selfTest(); exit(0) }
         if a.contains("--bench") { MainActor.assumeIsolated { bench() }; exit(0) }
         if let i = a.firstIndex(of: "--probe"), a.count >= i + 8 { probe(Array(a[(i + 1)...])); exit(0) }
@@ -310,8 +348,9 @@ struct RootView: View {
                 WorkspaceView(session: session, close: { self.session = nil; connID = ""; database = "" },
                               rename: { rename(session, $0) })
                     // Window title feeds the tab; the toolbar shows a rename button instead of the plain title.
-                    .navigationTitle(session.conn.kind == .sqlite || session.conn.database.isEmpty
-                                     ? session.conn.name : "\(session.conn.name) — \(session.conn.database)")
+                    .navigationTitle((session.conn.isProduction == true ? "PROD · " : "")
+                                     + (session.conn.kind == .sqlite || session.conn.database.isEmpty
+                                        ? session.conn.name : "\(session.conn.name) — \(session.conn.database)"))
                     .onChange(of: session.conn.database) { _, db in database = db }
             } else if let restoring {
                 ProgressView("Reconnecting to \(restoring)…").navigationTitle(restoring)
@@ -378,8 +417,9 @@ enum ToolbarTooltips {
         "Run": "Run query (⌘↩)",
         "Stop": "Stop query (⌘.)",
         "SQL Editor": "Show/hide SQL editor (⇧⌘E)",
-        "History": "Query history (⌘Y)",
+        "History": "Show query history in the sidebar (⌘Y)",
         "Disconnect": "Disconnect",
+        "Processes": "Server processes: see and kill client connections (⇧⌘P)",
         "New Tab": "New connection tab (⌘T)",
         "Sidebar": "Show/hide tables (⌘B)",
         "Details": "Show/hide row details (⌥⌘B)",
@@ -519,6 +559,25 @@ struct ConnectionsView: View {
                     SecureField("Password", text: Binding(get: { draft.password ?? "" },
                                                           set: { draft.password = $0.isEmpty ? nil : $0 })).selectAllOnFocus()
                     TextField(draft.kind == .redis ? "DB index" : "Database", text: $draft.database).selectAllOnFocus()
+                    Toggle("Connect over SSH", isOn: Binding(get: { draft.useSSH ?? false }, set: { draft.useSSH = $0 }))
+                        .help("Tunnels through an SSH server using your ~/.ssh config, keys and ssh-agent. Password login isn't supported.")
+                    if draft.useSSH == true {
+                        TextField("SSH host", text: Binding(get: { draft.sshHost ?? "" }, set: { draft.sshHost = $0 })).selectAllOnFocus()
+                        TextField("SSH port", text: Binding(get: { draft.sshPort ?? "22" }, set: { draft.sshPort = $0 })).selectAllOnFocus()
+                        TextField("SSH user", text: Binding(get: { draft.sshUser ?? "" }, set: { draft.sshUser = $0 })).selectAllOnFocus()
+                        HStack {
+                            TextField("SSH key (optional)", text: Binding(get: { draft.sshKey ?? "" }, set: { draft.sshKey = $0 }))
+                            Button("Choose…") { pickKey() }
+                        }
+                        Text("Host and port above are as seen from the SSH server (often localhost).")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Picker("TLS / SSL", selection: Binding(get: { draft.tlsMode }, set: { draft.tls = $0 })) {
+                        ForEach(TLSMode.allCases.filter { draft.kind != .redis || $0 != .prefer }, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    .help("Required suits servers with a self-signed certificate (e.g. a home server). Verify also checks the certificate and host name.")
+                    Toggle("Production database", isOn: Binding(get: { draft.isProduction ?? false }, set: { draft.isProduction = $0 }))
+                        .help("Marks the connection and asks before UPDATE/DELETE without WHERE, DROP, TRUNCATE, saving edits and importing.")
                     if draft.kind == .postgres || draft.kind == .redis {
                         Toggle("Allow cleartext password", isOn: Binding(get: { draft.allowCleartextPassword ?? false },
                                                                         set: { draft.allowCleartextPassword = $0 }))
@@ -567,6 +626,13 @@ struct ConnectionsView: View {
         if draft.id == c.id { new() }
     }
 
+    func pickKey() {
+        let p = NSOpenPanel()
+        p.showsHiddenFiles = true
+        p.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh")
+        if p.runModal() == .OK, let u = p.url { draft.sshKey = u.path }
+    }
+
     func pickFile() {
         let p = NSOpenPanel()
         p.allowsOtherFileTypes = true
@@ -603,15 +669,44 @@ struct WorkspaceView: View {
     @AppStorage("showEditor") private var showEditor = true
     @State private var columns = NavigationSplitViewVisibility.all
     @State private var pendingAction: (action: TableAction, table: String)?
-    @State private var showHistory = false
+    enum SidebarTab { case items, diagram, history }
+    @State private var sidebarTab = SidebarTab.items
     @State private var pendingSchema = false
+    @State private var pendingDatabase = false
+    @State private var transferMode: TransferSheet.Mode?
+    @State private var showProcesses = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
             VStack(spacing: 0) {
                 if !session.databases.isEmpty {
-                    DatabaseSwitcher(session: session, open: $dbPicker).padding(.horizontal, 10).padding(.top, 8)
+                    DatabaseSwitcher(session: session, open: $dbPicker, newDatabase: { pendingDatabase = true })
+                        .padding(.horizontal, 10).padding(.top, 8)
+                        .zIndex(1) // the dropdown draws over the tabs and table list below
                 }
+                Picker("Sidebar", selection: $sidebarTab) {
+                    Text("Items").tag(SidebarTab.items)
+                    if session.conn.kind != .redis { Text("Diagram").tag(SidebarTab.diagram) }
+                    Text("History").tag(SidebarTab.history)
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                .padding(.horizontal, 10).padding(.top, 8)
+                .onChange(of: sidebarTab) { _, tab in
+                    // Diagram mode shows the current table's diagram; back to Items shows its data.
+                    switch (tab, session.kind) {
+                    case (.diagram, .data): session.showDiagram(session.table ?? "") // no table open: whole database
+                    case (.diagram, .structure(let t)): session.showDiagram(t)
+                    case (.items, .diagram(let t)): session.openTable(t)
+                    default: break
+                    }
+                }
+                if sidebarTab == .history {
+                    HistorySidebar(history: session.history, conn: session.conn) { sql in
+                        if session.kind != .data { session.newTab() }
+                        session.sql = sql
+                        showEditor = true
+                    }
+                } else {
                 TextField(session.conn.kind == .redis ? "Filter keys" : "Filter tables", text: $filter)
                     .textFieldStyle(.roundedBorder)
                     .padding(.horizontal, 10).padding(.vertical, 8)
@@ -619,9 +714,9 @@ struct WorkspaceView: View {
                             stripPrefix: session.schemaPrefix,
                             icon: session.conn.kind == .redis ? "key" : "tablecells",
                             expandable: session.conn.kind != .redis,
-                            onSelect: { session.openTable($0) },
+                            onSelect: { sidebarTab == .diagram ? session.showDiagram($0) : session.openTable($0) },
                             loadColumns: { session.columns($0, done: $1) },
-                            actions: session.conn.kind == .redis ? [.openNewTab, .copyName] : TableAction.allCases,
+                            actions: session.conn.kind == .redis ? [.openNewTab, .copyName] : TableAction.allCases.filter { $0 != .diagram },
                             onAction: { handle($0, $1) })
                     .overlay {
                         if session.visibleTables.isEmpty {
@@ -630,9 +725,18 @@ struct WorkspaceView: View {
                                                    description: Text(session.databases.isEmpty ? "" : "Pick another database or schema."))
                         }
                     }
-                if session.conn.kind != .redis { SidebarFooter(session: session, newSchema: { pendingSchema = true }) }
+                }
+                if session.conn.kind != .redis {
+                    SidebarFooter(session: session, newSchema: { pendingSchema = true }, newDatabase: { pendingDatabase = true },
+                                  transfer: { transferMode = $0 })
+                }
             }
             .sheet(isPresented: $pendingSchema) { NewSchemaSheet(session: session) { pendingSchema = false } }
+            .sheet(isPresented: $pendingDatabase) { NewSchemaSheet(session: session, what: .database) { pendingDatabase = false } }
+            .sheet(isPresented: $showProcesses) { ProcessListSheet(session: session) { showProcesses = false } }
+            .sheet(isPresented: Binding(get: { transferMode != nil }, set: { if !$0 { transferMode = nil } })) {
+                if let m = transferMode { TransferSheet(mode: m, session: session) { transferMode = nil } }
+            }
             .navigationSplitViewColumnWidth(min: 200, ideal: 260)
         } detail: {
           VStack(spacing: 0) {
@@ -641,7 +745,9 @@ struct WorkspaceView: View {
             case .structure(let t):
                 StructureView(session: session, table: t)
             case .diagram:
-                DiagramView(model: session.diagram, error: session.error)
+                DiagramView(model: session.diagram, error: session.error,
+                            structure: { t in try? await session.onQueue { try $0.structure(t) } },
+                            onAction: { handle($0, $1) }, session: session)
             case .data:
             VSplitView {
                 if showEditor {
@@ -690,6 +796,11 @@ struct WorkspaceView: View {
                     TableActionSheet(action: p.action, table: p.table, session: session) { pendingAction = nil }
                 }
             }
+            .confirmationDialog(session.pendingConfirm?.title ?? "", isPresented: Binding(
+                get: { session.pendingConfirm != nil }, set: { if !$0 { session.pendingConfirm = nil } }), presenting: session.pendingConfirm) { p in
+                Button(p.button, role: .destructive) { session.pendingConfirm = nil; p.action() }
+                Button("Cancel", role: .cancel) { session.pendingConfirm = nil }
+            } message: { p in Text(p.details.joined(separator: "\n")) }
             .focusedSceneValue(\.renameConnection) { renaming = true }
             .focusedSceneValue(\.switchDatabase, session.databases.isEmpty ? nil : {
                 // The switcher lives in the sidebar: show it first, then open the picker.
@@ -706,6 +817,7 @@ struct WorkspaceView: View {
         // Window-level toolbar: placement no longer depends on which split-view columns are visible.
         .toolbar {
             ToolbarItem(placement: .navigation) { ConnectionTitle(session: session, rename: rename, editing: $renaming) }
+            ToolbarItem(placement: .principal) { ConnectionBar(session: session) }
         }
         .toolbar {
           // Same position whether or not the sidebar is visible (window-level, not per split column).
@@ -719,19 +831,17 @@ struct WorkspaceView: View {
                     .keyboardShortcut(.return, modifiers: .command)
                     .disabled(session.busy || session.kind != .data)
             }
-            Button { showHistory.toggle() } label: { Label("History", systemImage: "clock.arrow.circlepath") }
-                .keyboardShortcut("y", modifiers: .command)
-                .popover(isPresented: $showHistory, arrowEdge: .bottom) {
-                    HistoryPanel(history: session.history, conn: session.conn) { sql in
-                        showHistory = false
-                        if session.kind != .data { session.newTab() }
-                        session.sql = sql
-                        showEditor = true
-                    }
-                }
+            Button { withAnimation { columns = .all; sidebarTab = sidebarTab == .history ? .items : .history } } label: {
+                Label("History", systemImage: "clock.arrow.circlepath")
+            }
+            .keyboardShortcut("y", modifiers: .command)
             Button { withAnimation { showEditor.toggle() } } label: { Label("SQL Editor", systemImage: "rectangle.topthird.inset.filled") }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .help("Show/hide SQL editor (⇧⌘E)")
+            if session.conn.kind != .sqlite {
+                Button { showProcesses = true } label: { Label("Processes", systemImage: "person.2") }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+            }
             Button { close() } label: { Label("Disconnect", systemImage: "eject") }
             NewTabButton()
             Button { withAnimation { columns = columns == .detailOnly ? .all : .detailOnly } } label: {
@@ -794,7 +904,7 @@ struct SidebarList: NSViewRepresentable {
             guard let ov = outline, ov.clickedRow >= 0 else { return }
             let item = ov.item(atRow: ov.clickedRow)
             guard let name = (item as? TableNode)?.name ?? (item as? ColumnNode)?.table.name else { return }
-            let groups: [[TableAction]] = [[.openNewTab, .structure], [.diagram], [.copyName], [.clone, .truncate, .delete]]
+            let groups: [[TableAction]] = [[.openNewTab, .structure], [.copyName], [.clone, .truncate, .delete]]
             for group in groups {
                 let available = group.filter(actions.contains)
                 guard !available.isEmpty else { continue }
@@ -952,7 +1062,7 @@ struct SidebarList: NSViewRepresentable {
         menu.delegate = context.coordinator
         ov.menu = menu
         context.coordinator.outline = ov
-        let sv = NSScrollView()
+        let sv = FillScrollView()
         sv.documentView = ov
         sv.hasVerticalScroller = true
         sv.autohidesScrollers = true
@@ -1024,7 +1134,16 @@ struct ConnectionTitle: View {
                 Button { editing = true } label: {
                     HStack(spacing: 6) {
                         VStack(alignment: .leading, spacing: 0) {
-                            Text(session.conn.name).font(.headline).lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(session.conn.name).font(.headline).lineLimit(1)
+                                if session.conn.isProduction == true {
+                                    // Real status, not decoration: this connection asks before risky queries.
+                                    Text("Production").font(.caption.weight(.semibold)).foregroundStyle(.white)
+                                        .padding(.horizontal, 6).padding(.vertical, 1)
+                                        .background(RoundedRectangle(cornerRadius: 4).fill(Color(red: 0.75, green: 0.16, blue: 0.16)))
+                                        .help("Production: Kueri asks before risky queries, saves and imports")
+                                }
+                            }
                             if session.conn.kind != .sqlite, !session.conn.database.isEmpty {
                                 Text(session.conn.database).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                             }
@@ -1066,13 +1185,25 @@ extension WorkspaceView {
     }
 }
 
+/// Keeps a single-column table exactly as wide as the visible area. Column autoresizing alone
+/// misses the case where the view is created narrow and grows (e.g. switching sidebar tabs).
+final class FillScrollView: NSScrollView {
+    override func tile() {
+        super.tile()
+        guard let t = documentView as? NSTableView, t.tableColumns.count == 1 else { return }
+        let w = max(contentSize.width - t.intercellSpacing.width, 40)
+        if abs(t.tableColumns[0].width - w) > 0.5 { t.tableColumns[0].width = w }
+    }
+}
+
 /// Toolbar button + searchable popover. Replaces a SwiftUI Picker whose 107-item menu was
 /// rebuilt on every state change (~250 ms main-thread stall per database switch, measured).
 /// The list is only built while the popover is open.
 struct DatabaseSwitcher: View {
     @Bindable var session: Session
     @Binding var open: Bool
-    @State private var search = ""
+    var newDatabase: () -> Void = {}
+    @State private var buttonHeight: CGFloat = 28
     var body: some View {
         Button { open.toggle() } label: {
             HStack(spacing: 6) {
@@ -1088,32 +1219,15 @@ struct DatabaseSwitcher: View {
         }
         .buttonStyle(.plain)
         .help("Switch database (⌘K)")
-        .popover(isPresented: $open, arrowEdge: .bottom) {
-            VStack(spacing: 8) {
-                TextField("Search databases…", text: $search)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { if let first = filtered.first { pick(first) } }
-                List(filtered, id: \.self) { db in
-                    Button { pick(db) } label: {
-                        HStack {
-                            Text(db)
-                            Spacer()
-                            if db == session.conn.database { Image(systemName: "checkmark").foregroundStyle(.tint) }
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-                .listStyle(.plain)
+        .background(GeometryReader { g in Color.clear.onAppear { buttonHeight = g.size.height } })
+        // A dropdown hanging from the button, exactly as wide as it (not a popover).
+        .overlay(alignment: .top) {
+            if open {
+                DatabaseDropdown(session: session, newDatabase: newDatabase) { open = false }
+                    .offset(y: buttonHeight + 4)
             }
-            .padding(10)
-            .frame(width: 300, height: 380)
         }
     }
-    private var filtered: [String] {
-        search.isEmpty ? session.databases : session.databases.filter { $0.localizedCaseInsensitiveContains(search) }
-    }
-    private func pick(_ db: String) { open = false; search = ""; session.switchDatabase(db) }
 }
 
 /// Shown under the grid whenever there are unsaved edits, whether or not Details is open.
@@ -1144,12 +1258,55 @@ struct SaveBar: View {
 /// Cell-based NSTableView: cells are drawn, not instantiated as views, and only for visible
 /// columns. SwiftUI's Table (~56 ms/scroll page) and view-based NSTableView (one NSTextField per
 /// column per row: 285 columns ≈ 8.5k views, ~1.4 s to show) were both measured too slow.
+/// Table that paints rows in an edit state with a light tint across the whole row (under the cells).
+final class GridTable: NSTableView {
+    var isTinted: (Int) -> Bool = { _ in false }
+    override func drawRow(_ row: Int, clipRect: NSRect) {
+        if isTinted(row), !isRowSelected(row) {
+            ResultGrid.Coordinator.editTint.setFill()
+            rect(ofRow: row).fill(using: .sourceOver)
+        }
+        super.drawRow(row, clipRect: clipRect)
+    }
+}
+
+struct GridEditRequest: Equatable { let row: Int, column: Int; var id = UUID() }
+
+/// Grid cell; cells picked from a menu show a pop-up chevron at the right, like a pop-up button.
+final class GridCell: NSTextFieldCell {
+    static let indicatorWidth: CGFloat = 18
+    var showsMenuIndicator = false
+    private static let chevron = NSImage(systemSymbolName: "chevron.up.chevron.down", accessibilityDescription: nil)?
+        .withSymbolConfiguration(.init(pointSize: 10, weight: .medium).applying(.init(hierarchicalColor: .secondaryLabelColor)))
+
+    override func drawInterior(withFrame frame: NSRect, in view: NSView) {
+        guard showsMenuIndicator, let img = Self.chevron else { return super.drawInterior(withFrame: frame, in: view) }
+        var text = frame; text.size.width -= Self.indicatorWidth
+        super.drawInterior(withFrame: text, in: view)
+        let s = img.size
+        img.draw(in: NSRect(x: frame.maxX - Self.indicatorWidth + (Self.indicatorWidth - s.width) / 2, y: frame.midY - s.height / 2,
+                            width: s.width, height: s.height), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+}
+
 struct ResultGrid: NSViewRepresentable {
     let result: QueryResult
     var selection: Binding<Int?> = .constant(nil)
     var edits: [Int: [Int: String?]] = [:]
     var editable = false
     var onEdit: (Int, Int, String?) -> Void = { _, _, _ in }
+    /// Which cells edit inline (nil = all); a double-click elsewhere calls `onDoubleClick(row, column)`.
+    var editableCell: ((Int, Int) -> Bool)? = nil
+    /// Starts editing this cell once (e.g. the name of a row just added); a new id asks again.
+    var editRequest: GridEditRequest? = nil
+    var onDoubleClick: (Int, Int) -> Void = { _, _ in }
+    /// Cells edited by picking from a menu (double-click shows it on the cell); nil = not a menu cell.
+    var menuForCell: (Int, Int) -> [String]? = { _, _ in nil }
+    /// Menu cells holding a comma-separated list: items are ticked when in it, and every pick is passed on
+    /// (the owner toggles it), e.g. an index's columns.
+    var isMultiMenu: (Int, Int) -> Bool = { _, _ in false }
+    /// Rows in an edit state (e.g. not saved yet): a single click edits the clicked cell or opens its menu.
+    var editsOnSingleClick: (Int) -> Bool = { _ in false }
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         var result = QueryResult()
@@ -1157,6 +1314,36 @@ struct ResultGrid: NSViewRepresentable {
         var edits: [Int: [Int: String?]] = [:]
         var editable = false
         var onEdit: (Int, Int, String?) -> Void = { _, _, _ in }
+        var editableCell: ((Int, Int) -> Bool)?
+        var lastEditRequest: UUID?
+        var onDoubleClick: (Int, Int) -> Void = { _, _ in }
+        var menuForCell: (Int, Int) -> [String]? = { _, _ in nil }
+        var isMultiMenu: (Int, Int) -> Bool = { _, _ in false }
+        var editsOnSingleClick: (Int) -> Bool = { _ in false }
+        /// Rows whose editing started here and isn't reflected in `edits` yet (typing hasn't been committed).
+        var startedRows: Set<Int> = []
+        static let editTint = NSColor.systemOrange.withAlphaComponent(0.13)
+
+        /// Rows in an edit state: tinted, and a single click edits their cells.
+        func inEditState(_ row: Int) -> Bool { editsOnSingleClick(row) || startedRows.contains(row) }
+
+        func markStarted(_ row: Int, in tv: NSTableView) {
+            guard !inEditState(row) else { return }
+            startedRows.insert(row)
+            tv.setNeedsDisplay(tv.rect(ofRow: row))
+        }
+        private struct Pick { let row: Int, column: Int, value: String }
+
+        @objc func menuPicked(_ item: NSMenuItem) {
+            guard let p = item.representedObject as? Pick else { return }
+            let current = edits[p.row]?[p.column] ?? result.rows[p.row][p.column]
+            if p.value != current || isMultiMenu(p.row, p.column) { onEdit(p.row, p.column, p.value) }
+        }
+        func canEdit(_ column: NSTableColumn?, row: Int) -> Bool {
+            guard editable else { return false }
+            guard let editableCell else { return true }
+            return column.flatMap { Int($0.identifier.rawValue) }.map { editableCell(row, $0) } == true
+        }
         static let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         static func edited(_ s: String?) -> NSAttributedString {
             NSAttributedString(string: s ?? "NULL", attributes: [.foregroundColor: NSColor.systemOrange, .font: font])
@@ -1178,6 +1365,12 @@ struct ResultGrid: NSViewRepresentable {
             }
         }
 
+        func tableView(_ tv: NSTableView, willDisplayCell cell: Any, for column: NSTableColumn?, row: Int) {
+            guard let cell = cell as? GridCell, let i = column.flatMap({ Int($0.identifier.rawValue) }) else { return }
+            cell.showsMenuIndicator = menuForCell(row, i) != nil
+
+        }
+
         func tableView(_ tv: NSTableView, objectValueFor column: NSTableColumn?, row: Int) -> Any? {
             guard let column, let i = Int(column.identifier.rawValue), row < result.rows.count, i < result.rows[row].count else { return nil }
             if let e = edits[row]?[i] { return Self.edited(e) }
@@ -1185,11 +1378,41 @@ struct ResultGrid: NSViewRepresentable {
         }
 
         // Return edits the selected cell; double-click is handled explicitly below.
-        func tableView(_ tv: NSTableView, shouldEdit column: NSTableColumn?, row: Int) -> Bool { editable }
+        func tableView(_ tv: NSTableView, shouldEdit column: NSTableColumn?, row: Int) -> Bool { canEdit(column, row: row) }
+
+        @objc func clicked(_ tv: NSTableView) {
+            guard tv.clickedRow >= 0, tv.clickedColumn >= 0, inEditState(tv.clickedRow) else { return }
+            let column = tv.tableColumns[tv.clickedColumn]
+            // Only cells that edit or have a menu; a click elsewhere just selects.
+            guard let i = Int(column.identifier.rawValue), menuForCell(tv.clickedRow, i) != nil || canEdit(column, row: tv.clickedRow) else { return }
+            doubleClicked(tv)
+        }
 
         @objc func doubleClicked(_ tv: NSTableView) {
-            guard editable, tv.clickedRow >= 0, tv.clickedColumn >= 0 else { return }
-            tv.editColumn(tv.clickedColumn, row: tv.clickedRow, with: nil, select: true)
+            guard tv.clickedRow >= 0, tv.clickedColumn >= 0 else { return }
+            let column = tv.tableColumns[tv.clickedColumn]
+            if let i = Int(column.identifier.rawValue), let items = menuForCell(tv.clickedRow, i) {
+                let current = edits[tv.clickedRow]?[i] ?? result.rows[tv.clickedRow][i]
+                let multi = isMultiMenu(tv.clickedRow, i)
+                let ticked = Set((current ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+                let menu = NSMenu()
+                var selected: NSMenuItem?
+                for v in items {
+                    let mi = NSMenuItem(title: v, action: #selector(menuPicked(_:)), keyEquivalent: "")
+                    mi.target = self
+                    mi.representedObject = Pick(row: tv.clickedRow, column: i, value: v)
+                    if multi ? ticked.contains(v) : v == current { mi.state = .on; selected = selected ?? mi }
+                    menu.addItem(mi)
+                }
+                // Opens over the cell with the current value under the pointer, like a pop-up button.
+                let cell = tv.frameOfCell(atColumn: tv.clickedColumn, row: tv.clickedRow)
+                markStarted(tv.clickedRow, in: tv)
+                menu.popUp(positioning: multi ? nil : selected, at: NSPoint(x: cell.minX, y: cell.maxY - 2), in: tv)
+            } else if canEdit(column, row: tv.clickedRow) {
+                markStarted(tv.clickedRow, in: tv)
+                tv.editColumn(tv.clickedColumn, row: tv.clickedRow, with: nil, select: true)
+            }
+            else if let i = Int(column.identifier.rawValue) { onDoubleClick(tv.clickedRow, i) }
         }
 
         func tableView(_ tv: NSTableView, setObjectValue value: Any?, for column: NSTableColumn?, row: Int) {
@@ -1204,7 +1427,8 @@ struct ResultGrid: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let tv = NSTableView()
+        let tv = GridTable()
+        tv.isTinted = { [weak c = context.coordinator] row in c?.inEditState(row) ?? false }
         tv.style = .plain
         tv.focusRingType = .none // selection highlight is enough; the ring framed the whole grid
         tv.usesAlternatingRowBackgroundColors = true
@@ -1216,6 +1440,7 @@ struct ResultGrid: NSViewRepresentable {
         tv.delegate = context.coordinator
         tv.target = context.coordinator
         tv.doubleAction = #selector(Coordinator.doubleClicked(_:))
+        tv.action = #selector(Coordinator.clicked(_:))
         let sv = NSScrollView()
         sv.documentView = tv
         sv.hasVerticalScroller = true
@@ -1230,12 +1455,33 @@ struct ResultGrid: NSViewRepresentable {
         c.selection = selection
         c.editable = editable
         c.onEdit = onEdit
+        c.editableCell = editableCell
+        defer {
+            if let r = editRequest, r.id != c.lastEditRequest, let tv = sv.documentView as? NSTableView {
+                c.lastEditRequest = r.id
+                DispatchQueue.main.async {
+                    guard r.row < tv.numberOfRows, let col = tv.tableColumns.firstIndex(where: { $0.identifier.rawValue == String(r.column) }) else { return }
+                    tv.selectRowIndexes([r.row], byExtendingSelection: false)
+                    tv.scrollRowToVisible(r.row)
+                    c.markStarted(r.row, in: tv)
+                    tv.editColumn(col, row: r.row, with: nil, select: true)
+                }
+            }
+        }
+        c.onDoubleClick = onDoubleClick
+        c.menuForCell = menuForCell
+        c.isMultiMenu = isMultiMenu
+        c.editsOnSingleClick = editsOnSingleClick
         guard let tv = sv.documentView as? NSTableView else { return }
         if c.result.id == result.id {
-            if c.edits != edits { c.edits = edits; tv.reloadData() } // cheap for cell-based tables
+            if c.edits != edits {
+                if edits.isEmpty { c.startedRows = [] } // saved or discarded: back to the normal state
+                c.edits = edits; tv.reloadData()  // cheap for cell-based tables
+            }
             return
         }
         c.edits = edits
+        c.startedRows = []
         if tv.tableColumns.map(\.title) != result.columns {
             // Empty the table before touching columns: AppKit redraws visible rows while
             // columns change, and must not see old row indexes against the new data.
@@ -1246,7 +1492,7 @@ struct ResultGrid: NSViewRepresentable {
                 let col = NSTableColumn(identifier: .init(String(i)))
                 col.title = name
                 col.isEditable = true // gated by shouldEdit
-                let cell = NSTextFieldCell()
+                let cell = GridCell()
                 cell.isEditable = true // NSCell defaults to non-editable; shouldEdit still gates it
                 cell.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
                 cell.lineBreakMode = .byTruncatingTail
@@ -1254,7 +1500,7 @@ struct ResultGrid: NSViewRepresentable {
                 col.dataCell = cell
                 // Width from header + first rows, ~7.3pt per monospaced char.
                 let chars = result.rows.prefix(50).map { $0[i]?.count ?? 4 }.max() ?? 0
-                col.width = min(400, max(60, CGFloat(max(chars, name.count)) * 7.3 + 16))
+                col.width = min(400, max(60, CGFloat(max(chars, name.count)) * 7.3 + 16)) + (menuForCell(0, i) != nil ? GridCell.indicatorWidth : 0)
                 tv.addTableColumn(col)
             }
         }

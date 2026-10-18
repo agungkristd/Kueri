@@ -1,9 +1,10 @@
 #!/bin/sh
-# Builds Kueri.app. Needs: Xcode CLT + `brew install libpq`.
+# Builds Kueri.app. Needs: Xcode CLT + `brew install libpq openssl@3`.
 set -e
 cd "$(dirname "$0")"
 PQ=$(brew --prefix libpq 2>/dev/null || echo /usr/local/opt/libpq)
-swift build -c release -Xcc -I"$PQ/include" -Xlinker -L"$PQ/lib"
+SSL=$(brew --prefix openssl@3 2>/dev/null || echo /usr/local/opt/openssl@3)
+swift build -c release -Xcc -I"$PQ/include" -Xlinker -L"$PQ/lib" -Xcc -I"$SSL/include" -Xlinker -L"$SSL/lib"
 APP=Kueri.app
 [ -f AppIcon.icns ] || { swift icon.swift && iconutil -c icns AppIcon.iconset -o AppIcon.icns && rm -rf AppIcon.iconset; }
 rm -rf $APP && mkdir -p $APP/Contents/MacOS $APP/Contents/Resources

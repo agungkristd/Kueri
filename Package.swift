@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS("14.4")],
     targets: [
         .systemLibrary(name: "CPQ", path: "Sources/CPQ"),
-        .executableTarget(name: "Kueri", dependencies: ["CPQ"], path: "Sources/Kueri"),
+        .systemLibrary(name: "COpenSSL", path: "Sources/COpenSSL"),
+        .executableTarget(name: "Kueri", dependencies: ["CPQ", "COpenSSL"], path: "Sources/Kueri"),
     ]
 )

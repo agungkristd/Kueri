@@ -14,14 +14,17 @@ final class RedisDB: Database {
 
     /// No TLS yet, so AUTH would cross the network in clear text: it is only sent to this Mac unless
     /// `allowCleartextPassword` is set for the connection.
-    init(host: String, port: String, user: String, password: String, database: String, allowCleartextPassword: Bool = false) throws {
-        if !password.isEmpty, !allowCleartextPassword, !Self.isLoopback(host) {
+    init(host: String, port: String, user: String, password: String, database: String, allowCleartextPassword: Bool = false,
+         tls: TLSMode = .off, via: (host: String, port: String)? = nil) throws {
+        // Through an SSH tunnel the password travels encrypted, so the loopback rule doesn't apply.
+        if !password.isEmpty, !allowCleartextPassword, tls == .off, via == nil, !Self.isLoopback(host) {
             throw DBError("""
-                Kueri can't encrypt Redis connections yet, so the password would be sent unencrypted to \(host). \
-                If this server is on a network you trust, enable "Allow cleartext password" for this connection.
+                Without TLS the password would be sent unencrypted to \(host). Turn on TLS for this connection, \
+                or, if this server is on a network you trust, enable "Allow cleartext password".
                 """)
         }
-        sock = try Socket(host: host, port: port.isEmpty ? "6379" : port)
+        sock = try Socket(host: via?.host ?? host, port: via?.port ?? (port.isEmpty ? "6379" : port))
+        if tls != .off { try sock.startTLS(host: host, verify: tls == .verify) } // Redis TLS starts immediately
         if !password.isEmpty { try check(command(user.isEmpty ? ["AUTH", password] : ["AUTH", user, password])) }
         if !database.isEmpty, database != "0" { try check(command(["SELECT", database])) }
         try check(command(["PING"]))
@@ -91,6 +94,12 @@ final class RedisDB: Database {
             keys += ks.compactMap { if case .bulk(let k?) = $0 { k } else { nil } }
         } while cursor != "0" && keys.count < maxKeys
         return keys.prefix(maxKeys).sorted()
+    }
+
+    func serverVersion() throws -> String {
+        guard case .bulk(let info?) = try command(["INFO", "server"]),
+              let line = info.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("redis_version:") }) else { return "Redis" }
+        return "Redis " + line.dropFirst("redis_version:".count)
     }
 
     func databases() throws -> [String] {

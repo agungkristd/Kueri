@@ -17,8 +17,11 @@ final class MySQLDB: Database {
 
     /// `allowPublicKeyRetrieval`: for caching_sha2 full auth without TLS, fetch the server's RSA key.
     /// Off by default: on an untrusted network that key could be swapped to capture the password.
-    init(host: String, port: String, user: String, password: String, database: String, allowPublicKeyRetrieval: Bool = false) throws {
-        sock = try Socket(host: host, port: port.isEmpty ? "3306" : port)
+    private static let clientSSL: UInt32 = 0x800
+
+    init(host: String, port: String, user: String, password: String, database: String, allowPublicKeyRetrieval: Bool = false,
+         tls: TLSMode = .off, via: (host: String, port: String)? = nil) throws {
+        sock = try Socket(host: via?.host ?? host, port: via?.port ?? (port.isEmpty ? "3306" : port))
 
         // Initial handshake (protocol v10)
         var h = Reader(try readPacket())
@@ -28,15 +31,28 @@ final class MySQLDB: Database {
         h.skip(4)                     // thread id
         var scramble = h.take(8)
         h.skip(1)
-        h.skip(2 + 1 + 2 + 2)         // caps low, charset, status, caps high
+        let capsLow = UInt32(h.u16())
+        h.skip(1 + 2)                 // charset, status
+        let serverCaps = capsLow | UInt32(h.u16()) << 16
         let authLen = Int(h.u8())
         h.skip(10)
         scramble += h.take(max(13, authLen - 8)).prefix(12)
         try Self.checkScramble(scramble)
         var plugin = h.cstr()
 
+        // TLS: an SSLRequest (the response header alone), then the handshake, then the real response.
+        let useTLS = tls != .off && (serverCaps & Self.clientSSL != 0)
+        if (tls == .required || tls == .verify) && !useTLS {
+            throw DBError("TLS is required for this connection, but the MySQL server doesn't offer it.")
+        }
+        var caps = Self.caps | (database.isEmpty ? 0 : Self.connectWithDB)
+        if useTLS {
+            caps |= Self.clientSSL
+            try writePacket(le(caps) + le(UInt32(16 << 20)) + [45] + [UInt8](repeating: 0, count: 23))
+            try sock.startTLS(host: host, verify: tls == .verify)
+        }
+
         // Handshake response 41
-        let caps = Self.caps | (database.isEmpty ? 0 : Self.connectWithDB)
         var p = le(caps) + le(UInt32(16 << 20)) + [45] + [UInt8](repeating: 0, count: 23) // 45 = utf8mb4
         p += Array(user.utf8) + [0]
         let auth = Self.scramble(plugin, password, scramble)
@@ -58,12 +74,16 @@ final class MySQLDB: Database {
                 try Self.checkScramble(scramble)
                 try writePacket(Self.scramble(plugin, password, scramble))
             case 0x01 where r.count >= 2 && r[1] == 3: continue // caching_sha2 fast auth ok, OK packet follows
+            // Full auth over verified TLS: the password itself. Unverified TLS could be a man in the middle,
+            // so it takes the same opt-in as the RSA key below.
+            case 0x01 where r.count >= 2 && r[1] == 4 && sock.isEncrypted && (sock.isVerified || allowPublicKeyRetrieval):
+                try writePacket(Array(password.utf8) + [0])
             case 0x01 where r.count >= 2 && r[1] == 4:          // full auth: fetch server RSA key
                 guard allowPublicKeyRetrieval else {
                     throw DBError("""
-                        The server asked for full authentication, which without TLS means fetching its RSA public key. \
-                        On an untrusted network that key could be replaced to capture your password. If this server is on \
-                        a network you trust (localhost, your LAN), enable "Allow public key retrieval" for this connection.
+                        The server asked for full authentication. Without TLS set to Verify, the password (or the server's \
+                        RSA key) could be intercepted by someone on the network. Use TLS "Verify" for this connection, or, \
+                        if this server is on a network you trust (localhost, your LAN), enable "Allow public key retrieval".
                         """)
                 }
                 try writePacket([2])
@@ -98,6 +118,11 @@ final class MySQLDB: Database {
     }
 
     func databases() throws -> [String] { try firstColumn("SHOW DATABASES") }
+    func serverVersion() throws -> String {
+        let v = try firstColumn("SELECT VERSION()").first ?? ""  // "8.4.11" or "11.8.9-MariaDB-ubu2404"
+        return v.localizedCaseInsensitiveContains("mariadb")
+            ? "MariaDB " + (v.split(separator: "-").first.map(String.init) ?? v) : "MySQL " + v
+    }
 
     func browseQuery(_ t: String, offset: Int) -> String { "SELECT * FROM \(qualified(t)) LIMIT \(pageSize) OFFSET \(offset)" }
 
@@ -127,6 +152,18 @@ final class MySQLDB: Database {
             FROM information_schema.columns
             WHERE table_schema = \(schema) AND table_name = \(name)
             ORDER BY ordinal_position
+            """)
+    }
+
+    func indexes(_ t: String) throws -> QueryResult {
+        let (schema, name) = schemaAndName(t)
+        return try query("""
+            SELECT index_name AS index_name, index_type AS index_algorithm,
+                   IF(non_unique = 0, 'TRUE', 'FALSE') AS is_unique, IF(index_name = 'PRIMARY', 'TRUE', 'FALSE') AS is_primary,
+                   GROUP_CONCAT(IFNULL(column_name, '(expression)') ORDER BY seq_in_index SEPARATOR ', ') AS columns
+            FROM information_schema.statistics
+            WHERE table_schema = \(schema) AND table_name = \(name)
+            GROUP BY index_name, index_type, non_unique ORDER BY index_name = 'PRIMARY' DESC, index_name
             """)
     }
 
@@ -232,6 +269,45 @@ final class MySQLDB: Database {
         case 254: binary ? "binary" : "char"
         case 255: "geometry"
         default: ""
+        }
+    }
+
+    /// Column of a streamed result: how its values must be written back in a dump.
+    struct DumpColumn { let name: String; let numeric: Bool; let binary: Bool }
+
+    /// Runs one SELECT and hands every row's raw bytes to `onRow` as it arrives: no row cap, no
+    /// buffering, no text decoding (binary columns stay intact). Used by the dumper.
+    func streamRows(_ sql: String, onRow: ([DumpColumn], [[UInt8]?]) throws -> Void) throws {
+        seq = 0
+        try writePacket([0x03] + Array(sql.utf8))
+        let first = try readPacket()
+        if first.first == 0xFF { throw Self.error(first) }
+        var r = Reader(first)
+        let n = r.lenenc()
+        guard n <= 4096 else { throw DBError("Server reported \(n) columns") }
+        var cols: [DumpColumn] = []
+        for _ in 0..<n {
+            var c = Reader(try readPacket())
+            for _ in 0..<4 { c.skip(c.lenenc()) }
+            let name = String(decoding: c.take(c.lenenc()), as: UTF8.self)
+            c.skip(c.lenenc()); _ = c.lenenc()
+            let charset = c.u16(); c.skip(4)
+            let type = c.u8()
+            let numeric = [0, 1, 2, 3, 4, 5, 8, 9, 13, 246].contains(type)
+            // charset 63 = binary; numbers report it too, so only string/blob types count as binary
+            let binary = type == 16 || type == 255 || (charset == 63 && [15, 249, 250, 251, 252, 253, 254].contains(type))
+            cols.append(DumpColumn(name: name, numeric: numeric, binary: binary))
+        }
+        _ = try readPacket() // EOF after column definitions
+        while true {
+            let row = try readPacket()
+            if row.first == 0xFE && row.count < 9 { return }
+            if row.first == 0xFF { throw Self.error(row) }
+            var v = Reader(row)
+            try onRow(cols, (0..<n).map { _ in
+                if v.peek == 0xFB { v.skip(1); return nil }
+                return v.take(v.lenenc())
+            })
         }
     }
 

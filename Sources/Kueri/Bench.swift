@@ -275,5 +275,17 @@ import SwiftUI
     let labelled = ttw.toolbar?.items.filter { !$0.label.isEmpty } ?? []
     check("every toolbar button has a tooltip", !labelled.isEmpty && labelled.allSatisfy { ($0.toolTip ?? "").isEmpty == false })
     check("Run tooltip names its shortcut", labelled.first { $0.label == "Run" }?.toolTip == "Run query (⌘↩)")
-}
 
+    // Production mode: a risky query waits for confirmation; a safe one runs straight away.
+    var prodConn = Conn(name: "prod", kind: .sqlite, path: ":memory:"); prodConn.isProduction = true
+    let ps = Session.preview(prodConn)
+    _ = awaitTask { try await ps.execute("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1),(2)") }
+    ps.sql = "DELETE FROM t"; ps.run(); waitIdleOn(ps)
+    check("production: risky query asks first", ps.pendingConfirm != nil)
+    ps.sql = "SELECT count(*) AS n FROM t"; ps.pendingConfirm = nil; ps.run(); waitIdleOn(ps)
+    check("production: nothing deleted before confirming", ps.result.rows.first?.first == "2")
+    ps.sql = "DELETE FROM t"; ps.run(); waitIdleOn(ps)
+    ps.pendingConfirm?.action(); waitIdleOn(ps)
+    ps.sql = "SELECT count(*) AS n FROM t"; ps.run(); waitIdleOn(ps)
+    check("production: confirmed query runs", ps.result.rows.first?.first == "0")
+}

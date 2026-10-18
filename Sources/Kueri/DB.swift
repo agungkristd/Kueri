@@ -34,10 +34,18 @@ protocol Database: AnyObject {
     func structure(_ table: String) throws -> QueryResult
     /// Every foreign key in the current database/schema, for diagrams.
     func foreignKeys() throws -> [ForeignKey]
+    /// Indexes of a table: name, algorithm, unique, primary, columns (and definition where known).
+    func indexes(_ table: String) throws -> QueryResult
     /// Schemas the sidebar can switch between (Postgres); empty = no schema picker.
     func schemas() throws -> [String]
     /// The exact schema of a sidebar label (nil when the database has no schema picker).
     func schemaOf(_ table: String) -> String?
+    /// Server product and version for the connection bar, e.g. "PostgreSQL 16.8".
+    func serverVersion() throws -> String
+    /// Client connections on the server (nil = not supported, e.g. SQLite).
+    func processes() throws -> [ServerProcess]?
+    /// Ends a client connection, or with `queryOnly` just its running statement.
+    func killProcess(_ id: String, queryOnly: Bool) throws
     /// Table name quoted for this dialect (schema-qualified names keep their schema).
     func quoteTable(_ table: String) -> String
     /// `UPDATE table SET … WHERE key…` with values passed safely (bound or hex-encoded).
@@ -56,8 +64,12 @@ extension Database {
                            rows: cols.enumerated().map { [String($0.offset + 1), $0.element.name, $0.element.type, $0.element.isPrimaryKey ? "YES" : ""] })
     }
     func foreignKeys() throws -> [ForeignKey] { [] }
+    func indexes(_ table: String) throws -> QueryResult { QueryResult() }
     func schemas() throws -> [String] { [] }
     func schemaOf(_ table: String) -> String? { nil }
+    func serverVersion() throws -> String { "" }
+    func processes() throws -> [ServerProcess]? { nil }
+    func killProcess(_ id: String, queryOnly: Bool) throws { throw DBError("Not supported for this database") }
     func quoteTable(_ table: String) -> String { quoteIdent(table) }
     func update(_ table: String, set: [(String, String?)], key: [(String, String?)]) throws -> Int {
         throw DBError("Editing is not supported for this database")
@@ -79,6 +91,19 @@ struct ColumnInfo: Hashable {
 /// Never re-sorted: the database's column order is the order users expect.
 func columnInfos(_ rows: [[String?]]) -> [ColumnInfo] {
     rows.map { ColumnInfo(name: $0[0] ?? "", type: $0[1] ?? "", isPrimaryKey: ["1", "t", "true"].contains($0[2] ?? "")) }
+}
+
+/// Encryption for a connection. `prefer` = TLS when the server offers it (Postgres' default).
+enum TLSMode: String, Codable, CaseIterable {
+    case off, prefer, required, verify
+    var title: String {
+        switch self {
+        case .off: "Off"
+        case .prefer: "Prefer (if available)"
+        case .required: "Required (encrypt, don't check certificate)"
+        case .verify: "Verify (encrypt and check certificate + host)"
+        }
+    }
 }
 
 struct DBError: LocalizedError {
@@ -136,6 +161,7 @@ final class SQLiteDB: Database {
     }
     deinit { sqlite3_close(db) }
     func cancel() { sqlite3_interrupt(db) }
+    func serverVersion() throws -> String { "SQLite " + String(cString: sqlite3_libversion()) }
 
     func primaryKey(_ t: String) throws -> [String] {
         // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk (1-based order)
@@ -152,6 +178,16 @@ final class SQLiteDB: Database {
         return QueryResult(columns: ["#", "column_name", "data_type", "is_nullable", "column_default", "primary_key"],
                            rows: r.rows.map { [String((Int($0[0] ?? "0") ?? 0) + 1), $0[1], $0[2],
                                                $0[3] == "1" ? "NO" : "YES", $0[4], ($0[5].flatMap(Int.init) ?? 0) > 0 ? "YES" : ""] })
+    }
+
+    func indexes(_ t: String) throws -> QueryResult {
+        // PRAGMA index_list: seq, name, unique, origin (c = CREATE INDEX, u = UNIQUE, pk), partial
+        let list = try query("PRAGMA index_list(\(quote(table: t)))").rows
+        return QueryResult(columns: ["index_name", "index_algorithm", "is_unique", "is_primary", "columns"], rows: try list.map { r in
+            let name = r[1] ?? ""
+            let cols = try query("PRAGMA index_info(\(quoteIdent(name)))").rows.compactMap { $0[2] }.joined(separator: ", ")
+            return [name, "BTREE", r[2] == "1" ? "TRUE" : "FALSE", r[3] == "pk" ? "TRUE" : "FALSE", cols]
+        })
     }
 
     func foreignKeys() throws -> [ForeignKey] {
@@ -237,13 +273,19 @@ final class PostgresDB: Database {
 
     /// `allowCleartextPassword`: by default the server may not ask for the password in clear text
     /// (`require_auth=!password`), so a spoofed server can't collect it; scram, md5 and trust still work.
-    init(host: String, port: String, user: String, password: String, database: String, allowCleartextPassword: Bool = false) throws {
+    /// `via`: connect to this address instead (an SSH tunnel's local end); `host` is still used for
+    /// TLS certificate checks.
+    init(host: String, port: String, user: String, password: String, database: String, allowCleartextPassword: Bool = false,
+         tls: TLSMode = .prefer, via: (host: String, port: String)? = nil) throws {
         func kv(_ k: String, _ v: String) -> String {
             v.isEmpty ? "" : "\(k)='\(v.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'"))' "
         }
-        let info = kv("host", host) + kv("port", port) + kv("user", user) + kv("password", password)
+        let info = kv("host", host) + (via.map { kv("hostaddr", $0.host) + kv("port", $0.port) } ?? kv("port", port))
+            + kv("user", user) + kv("password", password)
             + kv("dbname", database) + "connect_timeout=10 application_name=Kueri"
             + (allowCleartextPassword ? "" : " require_auth=!password")
+            + " sslmode=" + ["off": "disable", "prefer": "prefer", "required": "require", "verify": "verify-full"][tls.rawValue]!
+            + (tls == .verify ? " sslrootcert=system" : "") // the system's trusted CAs (libpq 16+)
         conn = PQconnectdb(info)
         if PQstatus(conn) != CONNECTION_OK {
             // No PQfinish here: the object is fully initialized, so deinit frees it (double free otherwise).
@@ -272,6 +314,26 @@ final class PostgresDB: Database {
     }
 
     func schemaOf(_ table: String) -> String? { names.parts(table, defaultSchema: "public").schema }
+    func indexes(_ t: String) throws -> QueryResult {
+        let rel = "'" + quoteTable(t).replacingOccurrences(of: "'", with: "''") + "'::regclass"
+        return try query("""
+            SELECT ic.relname AS index_name, upper(am.amname) AS index_algorithm,
+                   CASE WHEN ix.indisunique THEN 'TRUE' ELSE 'FALSE' END AS is_unique,
+                   CASE WHEN ix.indisprimary THEN 'TRUE' ELSE 'FALSE' END AS is_primary,
+                   (SELECT string_agg(coalesce(a.attname, '(expression)'), ', ' ORDER BY k.ord)
+                      FROM unnest(ix.indkey) WITH ORDINALITY k(attnum, ord)
+                      LEFT JOIN pg_attribute a ON a.attrelid = ix.indrelid AND a.attnum = k.attnum) AS columns,
+                   pg_get_indexdef(ix.indexrelid) AS definition
+            FROM pg_index ix JOIN pg_class ic ON ic.oid = ix.indexrelid JOIN pg_am am ON am.oid = ic.relam
+            WHERE ix.indrelid = \(rel) ORDER BY ix.indisprimary DESC, ic.relname
+            """)
+    }
+
+    func serverVersion() throws -> String {
+        // "16.8 (Debian 16.8-1.pgdg120+1)" → "PostgreSQL 16.8"
+        let v = (try firstColumn("SHOW server_version").first ?? "").split(separator: " ").first.map(String.init) ?? ""
+        return "PostgreSQL " + v
+    }
 
     func schemas() throws -> [String] {
         try firstColumn("""
@@ -528,18 +590,86 @@ func selfTest() {
     for plain in ["SELECT * FROM users", "SELECT * FROM authors"] { assert(!QueryHistory.containsSecret(plain)) }
     assert(RedisDB.isLoopback("localhost") && RedisDB.isLoopback("127.0.0.1") && !RedisDB.isLoopback("192.168.1.10"))
     assert((try? RedisDB(host: "192.0.2.1", port: "6379", user: "", password: "pw", database: "0")) == nil) // refused before connecting
+    // Production safety: risky statements are found; strings, comments and dollar bodies don't fool it.
+    assert(riskyReasons("DELETE FROM t", kind: .postgres).count == 1)
+    assert(riskyReasons("delete from t where id = 1", kind: .postgres).isEmpty)
+    assert(riskyReasons("UPDATE t SET a = 'where'", kind: .postgres).count == 1) // WHERE inside a string doesn't count
+    assert(riskyReasons("SELECT 1; DROP TABLE x; TRUNCATE y", kind: .postgres).count == 2)
+    assert(riskyReasons("SELECT 'DROP TABLE x' -- DROP TABLE y\n", kind: .postgres).isEmpty)
+    assert(riskyReasons("ALTER TABLE t DROP COLUMN c", kind: .mysql).count == 1)
+    assert(riskyReasons("GET a\nFLUSHALL", kind: .redis).count == 1)
+    assert(splitSQL("CREATE FUNCTION f() RETURNS int AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 2").count == 2)
+    assert(splitSQL("SELECT 'a;b'; SELECT `c;d`; SELECT \"e;f\"").count == 3)
+    assert(splitSQL("DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END //\nDELIMITER ;\nSELECT 3;").count == 2)
+    assert(splitSQL("SELECT 1 # x; y\n; SELECT 2", hashComments: true).count == 2 && splitSQL("SELECT j #> '{a}'; SELECT 2").count == 2)
+    // Cross-version import: settings unknown to the target server are dropped, others kept.
+    let dumpURL = FileManager.default.temporaryDirectory.appendingPathComponent("kueri-filter-\(UUID()).sql")
+    try! "SET statement_timeout = 0;\nSET transaction_timeout = 0;\nCREATE TABLE a(x int);\n".write(to: dumpURL, atomically: true, encoding: .utf8)
+    let (f16, removed16) = try! PGDumpFilter.filtered(dumpURL, serverVersion: 160000)
+    assert(removed16 == 1 && !(try! String(contentsOf: f16, encoding: .utf8)).contains("transaction_timeout"))
+    assert(try! PGDumpFilter.filtered(dumpURL, serverVersion: 170000).removed == 0)
+    // psql runs the file inside our own \restrict block; the dump's own restrict lines are dropped.
+    try! "\\restrict abc\nSELECT 1;\n\\unrestrict abc\n".write(to: dumpURL, atomically: true, encoding: .utf8)
+    let wrapped = try! String(contentsOf: PGDumpFilter.filtered(dumpURL, serverVersion: 170000, key: "k1").0, encoding: .utf8)
+    assert(wrapped == "\\restrict k1\nSELECT 1;\n\\unrestrict k1\n", wrapped)
+    // MySQL dump values: numbers bare, binary as hex, text escaped.
+    assert(MySQLDump.literal(Array("12.5".utf8), .init(name: "n", numeric: true, binary: false)) == "12.5")
+    assert(MySQLDump.literal([0, 255], .init(name: "b", numeric: false, binary: true)) == "X'00FF'")
+    assert(MySQLDump.literal(Array("a'b\\c\n".utf8), .init(name: "t", numeric: false, binary: false)) == "'a\\'b\\\\c\\n'")
+    assert(MySQLDump.literal(nil, .init(name: "t", numeric: false, binary: false)) == "NULL")
+    // Column DDL: only what changed, per dialect.
+    let oldCol = ColumnDef(name: "a", type: "integer", nullable: true)
+    assert(Session.alterColumnSQL(.postgres, table: "\"t\"", from: oldCol, to: oldCol).isEmpty)
+    assert(Session.alterColumnSQL(.postgres, table: "\"t\"", from: oldCol, to: ColumnDef(name: "b", type: "bigint", nullable: false, defaultSQL: "0")) == [
+        "ALTER TABLE \"t\" RENAME COLUMN \"a\" TO \"b\"", "ALTER TABLE \"t\" ALTER COLUMN \"b\" TYPE bigint USING \"b\"::bigint",
+        "ALTER TABLE \"t\" ALTER COLUMN \"b\" SET NOT NULL", "ALTER TABLE \"t\" ALTER COLUMN \"b\" SET DEFAULT 0"])
+    assert(Session.alterColumnSQL(.mysql, table: "`t`", from: ColumnDef(name: "id", type: "int", extra: "auto_increment"),
+                                  to: ColumnDef(name: "id2", type: "bigint", nullable: false, extra: "auto_increment", comment: "it's"))
+           == ["ALTER TABLE `t` CHANGE COLUMN `id` `id2` bigint NOT NULL auto_increment COMMENT 'it''s'"])
+    assert(Session.alterColumnSQL(.sqlite, table: "\"t\"", from: oldCol, to: ColumnDef(name: "a", type: "text")).isEmpty)
+    assert(Session.dropColumnSQL(.mysql, table: "`t`", column: "a`b") == "ALTER TABLE `t` DROP COLUMN `a``b`")
+    let mysqlRow = ColumnDef(row: ["1", "c", "varchar", "varchar(20)", "NO", "x'y", "", ""],
+                             header: ["#", "column_name", "data_type", "full_type", "is_nullable", "column_default", "extra", "comment"])
+    assert(mysqlRow == ColumnDef(name: "c", type: "varchar(20)", nullable: false, defaultSQL: "'x''y'"))
+    // Column type picker: parameterised types split into base + digits; others kept whole.
+    assert(ColumnType("character varying(200)") == ColumnType(base: "character varying", arguments: "200"))
+    assert(ColumnType("numeric(10, 2)").sql == "numeric(10,2)")
+    assert(ColumnType("timestamp(6) without time zone").base == "timestamp(6) without time zone")
+    assert(ColumnType.choices(.postgres, current: "timestamp(6) without time zone").first == "timestamp(6) without time zone")
+    assert(!ColumnType(base: "varchar", arguments: "2x").argumentsValid && ColumnType(base: "varchar", arguments: "").sql == "varchar")
+    assert(ColumnType.resolved("_int4", previous: "integer", kind: .postgres) == "int4[]")
+    assert(ColumnType.resolved("varchar", previous: "char(12)", kind: .mysql) == "varchar(12)")
+    assert(ColumnType.resolved("varchar", previous: "int", kind: .mysql) == "varchar(255)")
+    assert(Session.addColumnSQL(.postgres, table: "\"t\"", column: ColumnDef(name: "n", type: "int8", nullable: false, defaultSQL: "0"))
+           == "ALTER TABLE \"t\" ADD COLUMN \"n\" int8 NOT NULL DEFAULT 0")
+    assert(Session.addColumnSQL(.mysql, table: "`t`", column: ColumnDef(name: "n", type: "varchar(255)")) == "ALTER TABLE `t` ADD COLUMN `n` varchar(255)")
+    assert(Session.createIndexSQL(.postgres, table: "\"t\"", name: "i", columns: ["a", "b"], unique: true, algorithm: "BTREE")
+           == "CREATE UNIQUE INDEX \"i\" ON \"t\" USING btree (\"a\", \"b\")")
+    assert(Session.createIndexSQL(.mysql, table: "`t`", name: "i", columns: ["a"], unique: false, algorithm: "HASH") == "CREATE INDEX `i` USING HASH ON `t` (`a`)")
+    assert(Session.dropIndexSQL(.mysql, table: "`t`", schema: nil, name: "PRIMARY", primary: true) == ["ALTER TABLE `t` DROP PRIMARY KEY"])
+    assert(ColumnType.fullName("timestamp", kind: .postgres) == "timestamp without time zone")
+    assert(ColumnType.fullName("int4[]", kind: .postgres) == "integer[]" && ColumnType.fullName("varchar(255)", kind: .mysql) == "varchar(255)")
     print("selftest ok")
 }
 
 // Run: Kueri --probe <sqlite|postgres|mysql|redis> host port user password database "query"
 func probe(_ a: [String]) {
+    let tls = TLSMode(rawValue: ProcessInfo.processInfo.environment["KUERI_TLS"] ?? "")
     do {
+        // KUERI_SSH="host:port:user:keyfile" tunnels like the app does.
+        var via: (host: String, port: String)?, tunnel: SSHTunnel?
+        if let spec = ProcessInfo.processInfo.environment["KUERI_SSH"]?.split(separator: ":", maxSplits: 3).map(String.init), spec.count == 4 {
+            tunnel = try SSHTunnel(sshHost: spec[0], sshPort: spec[1], sshUser: spec[2], keyPath: spec[3], dbHost: a[1], dbPort: a[2])
+            via = ("127.0.0.1", String(tunnel!.localPort))
+            print("tunnel: 127.0.0.1:\(tunnel!.localPort) -> \(a[1]):\(a[2]) via \(spec[0])")
+        }
+        defer { _ = tunnel }
         let db: Database = switch a[0] {
-        case "postgres": try PostgresDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5])
+        case "postgres": try PostgresDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5], tls: tls ?? .prefer, via: via)
         case "postgres-cleartext": try PostgresDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5], allowCleartextPassword: true)
-        case "mysql": try MySQLDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5], allowPublicKeyRetrieval: true) // dev tool
+        case "mysql": try MySQLDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5], allowPublicKeyRetrieval: tls == nil, tls: tls ?? .off, via: via) // dev tool
         case "mysql-strict": try MySQLDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5])
-        case "redis": try RedisDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5])
+        case "redis": try RedisDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5], tls: tls ?? .off, via: via)
         case "redis-cleartext": try RedisDB(host: a[1], port: a[2], user: a[3], password: a[4], database: a[5], allowCleartextPassword: true)
         default: try SQLiteDB(path: a[1])
         }
