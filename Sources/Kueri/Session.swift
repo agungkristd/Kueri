@@ -337,7 +337,7 @@ enum LegacyMigration {
     /// Why the selected row can't be edited, or nil if it can.
     var readOnlyReason: String? {
         if conn.kind == .redis { return "Read-only: editing Redis values isn't supported yet." }
-        if table == nil { return "Read-only: open a table from the sidebar to edit." }
+        if table == nil { return "Read-only: only a table from the sidebar or SELECT * FROM one table can be edited." }
         if primaryKey.isEmpty { return "Read-only: \(table!) has no primary key." }
         if let k = primaryKey.first(where: { !result.columns.contains($0) }) { return "Read-only: key column \(k) not in result." }
         return nil

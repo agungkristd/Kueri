@@ -157,6 +157,9 @@ PostgreSQL client tools, OpenSSL and MIT Kerberos under their own permissive lic
 - The query timeout applies to PostgreSQL and MySQL (SELECT only), not to SQLite or Redis, and to
   connections opened after it's set.
 - Redis values are read-only.
+- Editing, deleting rows and sorting by header work on a table opened from the sidebar or a
+  `SELECT * FROM one_table` with at most WHERE, ORDER BY, LIMIT and OFFSET; joins, column lists and
+  other queries are read-only. Edits and deletes also need the table's primary key in the result.
 - Deleting several rows runs one DELETE per row, not in a transaction; a failure part-way leaves
   the rows before it deleted.
 - A foreign key over several columns is followed by the clicked column only.
