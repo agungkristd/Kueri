@@ -93,6 +93,7 @@ struct WorkspaceView: View {
                 if let m = transferMode { TransferSheet(mode: m, session: session) { transferMode = nil } }
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 260)
+            .toolbar(removing: .sidebarToggle) // the toolbar's Sidebar button (with its keymap shortcut) does this
         } detail: {
           VStack(spacing: 0) {
             TabStrip(session: session)

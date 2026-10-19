@@ -580,6 +580,16 @@ final class PostgresDB: Database {
         return try execParams(sql, key.map(\.1)).affected
     }
 
+    /// The query is shown in the editor, so the value is inlined: as an E'' literal, which escapes
+    /// backslashes the same way whatever the server's standard_conforming_strings says.
+    func filterQuery(_ t: String, column: String, value: String) -> String {
+        "SELECT * FROM \(quote(table: t)) WHERE \(quoteIdent(column)) = \(Self.literal(value)) LIMIT \(pageSize)"
+    }
+
+    static func literal(_ v: String) -> String {
+        "E'" + v.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "''") + "'"
+    }
+
     /// Parameters go over the wire separately from the SQL text (no quoting/injection issues).
     private func execParams(_ sql: String, _ params: [String?]) throws -> (rows: [[String?]], affected: Int) {
         let cs = params.map { $0.flatMap { strdup($0) } }
@@ -676,6 +686,7 @@ func selfTest() {
     // Following a foreign key finds the parent row (quotes in values are escaped); delete goes by key.
     _ = try! db.query("INSERT INTO parent(id, name) VALUES (1, 'a'), (2, 'it''s')")
     assert(try! db.query(db.filterQuery("parent", column: "name", value: "it's")).rows == [["2", "it's"]])
+    assert(PostgresDB.literal(#"a\'b"#) == #"E'a\\''b'"#)
     assert(try! db.delete("parent", key: [("id", "1")]) == 1 && db.delete("parent", key: [("id", "1")]) == 0)
     assert(try! db.query("SELECT id FROM parent").rows == [["2"]])
     _ = try! db.query("DELETE FROM parent")

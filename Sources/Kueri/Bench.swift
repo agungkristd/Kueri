@@ -152,6 +152,29 @@ import SwiftUI
     let end2 = Date().addingTimeInterval(5); while ts.diagram == nil && Date() < end2 { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
     check("diagram includes related tables and the FK link", Set(ts.diagram?.tables.map(\.name) ?? []) == ["users", "upload_logs"]
           && ts.diagram?.links == [ForeignKey(fromTable: "upload_logs", fromColumn: "user_id", toTable: "users", toColumn: "id")])
+    // Zoomed out, the diagram is smaller than the view: a table can still be dragged to its edge.
+    if let model = ts.diagram {
+        let dw = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 900, height: 600), styleMask: [.titled], backing: .buffered, defer: false)
+        let dh = NSHostingView(rootView: DiagramView(model: model))
+        dw.contentView = dh; dw.orderFrontRegardless()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        func canvasIn(_ v: NSView) -> DiagramCanvas? { (v as? DiagramCanvas) ?? v.subviews.lazy.compactMap(canvasIn).first }
+        if let canvas = canvasIn(dh), let sv = canvas.enclosingScrollView {
+            canvas.setZoom(0.2); RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            func event(_ type: NSEvent.EventType, _ w: NSPoint) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: w, modifierFlags: [], timestamp: 0, windowNumber: dw.windowNumber,
+                                   context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            }
+            let grab = canvas.convert(CGPoint(x: 430, y: 50), to: nil)   // header of the focused table
+            let edge = sv.convert(CGPoint(x: 8, y: sv.bounds.midY), to: nil)
+            let emptyBefore = canvas.menu(for: event(.rightMouseDown, edge)) == nil
+            canvas.mouseDown(with: event(.leftMouseDown, grab))
+            canvas.mouseDragged(with: event(.leftMouseDragged, edge))
+            canvas.mouseUp(with: event(.leftMouseUp, edge))
+            check("zoomed-out diagram: table drags to the view's edge", emptyBefore && canvas.menu(for: event(.rightMouseDown, edge)) != nil)
+        } else { check("diagram canvas found", false) }
+        dw.close()
+    }
     check("four tabs open", ts.tabs.count == 4)
     ts.closeTab(ts.activeTab)
     check("closing a tab activates a neighbour", ts.tabs.count == 3 && ts.kind == .structure("upload_logs"))

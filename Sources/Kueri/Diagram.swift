@@ -104,6 +104,7 @@ struct DiagramSurface: NSViewRepresentable {
         let sv = NSScrollView()
         sv.hasVerticalScroller = true; sv.hasHorizontalScroller = true; sv.autohidesScrollers = true
         sv.drawsBackground = false
+        sv.contentView = CenteringClipView()
         sv.allowsMagnification = true
         sv.minMagnification = DiagramView.zoomRange.lowerBound
         sv.maxMagnification = DiagramView.zoomRange.upperBound
@@ -135,6 +136,7 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
     private var bends: [String: CGSize] = [:]   // relation line → how far its middle was dragged
     private var selected: String?               // "" = cleared by a click on empty space
     private var observers: [NSObjectProtocol] = []
+    private var room = CGRect.null              // canvas kept once a table drag opened it to the view's edges
 
     private typealias T = DiagramView
     override var isFlipped: Bool { true }
@@ -155,7 +157,7 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
         let old = model
         model = m
         if old == nil || old?.focus != m.focus {
-            pos = [:]; bends = [:]; selected = nil
+            pos = [:]; bends = [:]; selected = nil; room = .null
             scrollView?.magnification = 1
         }
         if m.highlight != old?.highlight, let h = m.highlight { selected = h }
@@ -189,11 +191,28 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
         CGRect(origin: point(t.name), size: CGSize(width: T.width, height: T.height(t)))
     }
 
+    /// The tables plus a margin; tables dragged left or up can have negative positions.
+    private var content: CGRect {
+        guard let m = model else { return .zero }
+        var r = CGRect(x: 0, y: 0, width: 800, height: 600)
+        for t in m.tables { r = r.union(rect(t).insetBy(dx: -40, dy: -40)) }
+        return r
+    }
+
+    /// Sizes the canvas to the content (bounds origin = its top-left, so positions need no offset)
+    /// without moving anything on screen.
     private func resize() {
         guard let m = model else { return }
-        var w: CGFloat = 800, h: CGFloat = 600
-        for t in m.tables { let r = rect(t); w = max(w, r.maxX + 80); h = max(h, r.maxY + 80) }
-        if frame.size != CGSize(width: w, height: h) { setFrameSize(CGSize(width: w, height: h)) }
+        let new = content.union(room).integral, old = bounds
+        if new != old {
+            setFrameSize(new.size); setBoundsOrigin(new.origin)
+            if let clip = scrollView?.contentView, old.origin != new.origin {
+                var o = clip.bounds.origin
+                o.x += old.minX - new.minX; o.y += old.minY - new.minY
+                clip.scroll(to: clip.constrainBoundsRect(CGRect(origin: o, size: clip.bounds.size)).origin)
+                scrollView?.reflectScrolledClipView(clip)
+            }
+        }
         removeAllToolTips()
         for t in m.tables { addToolTip(rect(t), owner: self, userData: nil) }
     }
@@ -205,10 +224,9 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
     /// Scrolls so the table is in the middle of the view.
     private func reveal(_ name: String) {
         guard let sv = scrollView, let t = model?.tables.first(where: { $0.name == name }) else { return }
-        let r = rect(t), clip = sv.contentView, size = clip.bounds.size
+        let r = convert(rect(t), to: sv.contentView), clip = sv.contentView, size = clip.bounds.size
         var o = CGPoint(x: r.midX - size.width / 2, y: r.midY - size.height / 2)
-        o.x = min(max(0, o.x), max(0, frame.width - size.width))
-        o.y = min(max(0, o.y), max(0, frame.height - size.height))
+        o = clip.constrainBoundsRect(CGRect(origin: o, size: size)).origin
         clip.scroll(to: o); sv.reflectScrolledClipView(clip)
     }
 
@@ -255,7 +273,7 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
 
     func fit() {
         guard let sv = scrollView else { return }
-        sv.magnify(toFit: bounds)
+        sv.magnify(toFit: content)
         if sv.magnification > 1 { sv.setMagnification(1, centeredAt: .zero) }
         zoomChanged()
     }
@@ -442,6 +460,9 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
         if let t = table(at: p) {
             let o = point(t.name)
             drag = .table(t.name, offset: CGSize(width: p.x - o.x, height: p.y - o.y))
+            // Zoomed out, the canvas is smaller than the view: open it to the view's edges so the
+            // table can be dragged anywhere visible.
+            if let clip = scrollView?.contentView { room = room.union(convert(clip.bounds, from: clip)); resize() }
             NSCursor.closedHand.set()
         } else if let fk = link(at: p) {
             drag = .line(T.linkKey(fk), last: p)
@@ -456,7 +477,7 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
         let p = convert(e.locationInWindow, from: nil)
         switch drag {
         case .table(let name, let offset):
-            pos[name] = CGPoint(x: max(0, p.x - offset.width), y: max(0, p.y - offset.height))
+            pos[name] = CGPoint(x: max(bounds.minX, p.x - offset.width), y: max(bounds.minY, p.y - offset.height))
             resize(); needsDisplay = true
         case .line(let key, let last):
             let o = bends[key] ?? .zero
@@ -469,8 +490,7 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
             var o = clip.bounds.origin
             o.x -= (w.x - last.x) / m
             o.y += (w.y - last.y) / m // window y grows upwards, this view's downwards
-            o.x = min(max(0, o.x), max(0, frame.width - clip.bounds.width))
-            o.y = min(max(0, o.y), max(0, frame.height - clip.bounds.height))
+            o = clip.constrainBoundsRect(CGRect(origin: o, size: clip.bounds.size)).origin
             clip.scroll(to: o); sv.reflectScrolledClipView(clip)
             drag = .pan(last: w)
         case nil: break
@@ -517,6 +537,17 @@ final class DiagramCanvas: NSView, NSViewToolTipOwner {
 }
 
 /// A menu item that runs a closure.
+/// Keeps a diagram smaller than the view (zoomed out) in the middle instead of the top-left corner.
+final class CenteringClipView: NSClipView {
+    override func constrainBoundsRect(_ proposed: NSRect) -> NSRect {
+        var r = super.constrainBoundsRect(proposed)
+        guard let doc = documentView?.frame else { return r }
+        if doc.width < r.width { r.origin.x = doc.minX - (r.width - doc.width) / 2 }
+        if doc.height < r.height { r.origin.y = doc.minY - (r.height - doc.height) / 2 }
+        return r
+    }
+}
+
 final class ClosureMenuItem: NSMenuItem {
     private let run: () -> Void
     init(_ title: String, _ run: @escaping () -> Void) {
