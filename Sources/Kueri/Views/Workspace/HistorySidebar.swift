@@ -19,9 +19,7 @@ struct HistorySidebar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            TextField("Search history…", text: $search)
-                .textFieldStyle(.roundedBorder)
-                .padding(.horizontal, 10).padding(.vertical, 8)
+            SidebarSearchField(prompt: "Search history…", text: $search)
             if mine.isEmpty {
                 ContentUnavailableView(search.isEmpty ? "No history" : "No matches", systemImage: "clock.arrow.circlepath",
                                        description: Text(search.isEmpty ? "Queries you run on \(conn.database.isEmpty ? conn.name : conn.database) appear here." : ""))

@@ -57,3 +57,23 @@ struct HideToolbarTitle: ViewModifier {
         if #available(macOS 15, *) { content.toolbar(removing: .title) } else { content }
     }
 }
+
+extension View {
+    /// A strip along the bottom of a pane (unsaved changes, selected rows).
+    func bottomBar() -> some View {
+        padding(.horizontal, 10).padding(.vertical, 6)
+            .background(.bar)
+            .overlay(alignment: .top) { Divider() }
+    }
+}
+
+/// The search field at the top of a sidebar tab.
+struct SidebarSearchField: View {
+    let prompt: String
+    @Binding var text: String
+    var body: some View {
+        TextField(prompt, text: $text)
+            .textFieldStyle(.roundedBorder)
+            .padding(.horizontal, 10).padding(.vertical, 8)
+    }
+}

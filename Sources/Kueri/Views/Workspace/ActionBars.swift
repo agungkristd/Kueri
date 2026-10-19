@@ -1,7 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// Shown under the grid whenever there are unsaved edits, whether or not Details is open.
 /// Several rows selected: how many, and a button to delete them. Its own view, so selecting
 /// rows only redraws this bar.
 struct SelectionBar: View {
@@ -15,13 +14,12 @@ struct SelectionBar: View {
                 Spacer()
                 Button("Delete \(n) Rows…", role: .destructive) { session.deleteRows(session.selectedRows) }
             }
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(.bar)
-            .overlay(alignment: .top) { Divider() }
+            .bottomBar()
         }
     }
 }
 
+/// Shown under the grid whenever there are unsaved edits, whether or not Details is open.
 struct SaveBar: View {
     @Bindable var session: Session
     var body: some View {
@@ -39,8 +37,6 @@ struct SaveBar: View {
             .disabled(session.saving)
             .help("Save changes (⌘S)")
         }
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .background(.bar)
-        .overlay(alignment: .top) { Divider() }
+        .bottomBar()
     }
 }

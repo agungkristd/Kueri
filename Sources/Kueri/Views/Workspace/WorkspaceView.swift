@@ -62,9 +62,7 @@ struct WorkspaceView: View {
                         showEditor = true
                     }
                 } else {
-                TextField(session.conn.kind == .redis ? "Filter keys" : "Filter tables", text: $filter)
-                    .textFieldStyle(.roundedBorder)
-                    .padding(.horizontal, 10).padding(.vertical, 8)
+                SidebarSearchField(prompt: session.conn.kind == .redis ? "Filter keys" : "Filter tables", text: $filter)
                 SidebarList(items: session.visibleTables.filter { nameMatches(filter, $0) },
                             stripPrefix: session.schemaPrefix,
                             icon: session.conn.kind == .redis ? "key" : "tablecells",
