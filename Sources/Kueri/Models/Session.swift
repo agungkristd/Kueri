@@ -1,75 +1,6 @@
 import SwiftUI
 import os
 
-// MARK: Saved connections, passwords included, in UserDefaults
-// (~/Library/Preferences/app.kueri.plist, readable only by the user). Not Keychain, by choice.
-// Limitation: password stored in plain text; Keychain storage would encrypt it at rest
-
-struct Conn: Codable, Identifiable, Hashable {
-    enum Kind: String, Codable, CaseIterable {
-        case sqlite = "SQLite", postgres = "PostgreSQL", mysql = "MySQL / MariaDB", redis = "Redis"
-        var shortName: String { self == .mysql ? "MySQL" : rawValue }
-        var icon: String {
-            switch self {
-            case .postgres, .mysql: "cylinder.split.1x2"
-            case .sqlite: "doc"
-            case .redis: "memorychip"
-            }
-        }
-        var defaults: (port: String, user: String, database: String) {
-            switch self {
-            case .postgres: ("5432", "postgres", "postgres")
-            case .mysql: ("3306", "root", "")
-            case .redis: ("6379", "", "0")
-            case .sqlite: ("", "", "")
-            }
-        }
-    }
-    var id = UUID()
-    var name = "New connection"
-    var kind = Kind.postgres
-    var host = "localhost", port = "5432", user = "postgres", database = "postgres"
-    var path = ""
-    var password: String? // optional so connections saved before this field still decode
-    var allowPublicKeyRetrieval: Bool? // MySQL caching_sha2 without TLS; nil = off
-    var allowCleartextPassword: Bool?  // Postgres "password" auth / Redis AUTH to non-local hosts; nil = off
-    var isProduction: Bool?            // asks before risky queries, saves and imports
-    var tls: TLSMode?                  // nil = the default for the kind (Postgres prefer, others off)
-    var useSSH: Bool?                  // tunnel through ssh; host/port are then as seen from the SSH server
-    var sshHost: String?, sshPort: String?, sshUser: String?, sshKey: String?
-    var tlsMode: TLSMode { tls ?? (kind == .postgres ? .prefer : .off) }
-}
-
-@Observable final class Store {
-    var conns: [Conn] {
-        didSet { UserDefaults.standard.set(try? JSONEncoder().encode(conns), forKey: "conns") }
-    }
-    init() {
-        LegacyMigration.run() // before reading, so connections saved under the old name show up
-        conns = (UserDefaults.standard.data(forKey: "conns").flatMap { try? JSONDecoder().decode([Conn].self, from: $0) }) ?? []
-    }
-}
-
-/// One-time import from the app's previous name (LiteTable, bundle id local.litetable): connections,
-/// panel settings and query history. Copies only; never deletes the old data.
-enum LegacyMigration {
-    static func run(defaults d: UserDefaults = .standard, old: UserDefaults? = UserDefaults(suiteName: "local.litetable"),
-                    support: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]) {
-        if d.data(forKey: "conns") == nil, let old, old.data(forKey: "conns") != nil {
-            for k in ["conns", "showDetails", "showEditor"] { if let v = old.object(forKey: k) { d.set(v, forKey: k) } }
-        }
-        let fm = FileManager.default
-        let oldHistory = support.appendingPathComponent("LiteTable/history.json")
-        let newHistory = support.appendingPathComponent("Kueri/history.json")
-        if !fm.fileExists(atPath: newHistory.path), fm.fileExists(atPath: oldHistory.path) {
-            try? fm.createDirectory(at: newHistory.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? fm.copyItem(at: oldHistory, to: newHistory)
-        }
-    }
-}
-
-// MARK: Open session: one serial queue per connection, UI never blocks
-
 @MainActor @Observable final class Session {
     private(set) var conn: Conn
     private var db: Database
@@ -240,7 +171,7 @@ enum LegacyMigration {
     func run(_ text: String? = nil, confirmed: Bool = false) {
         let q = text ?? sql
         guard !q.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !busy else { return }
-        if conn.isProduction == true, !confirmed {
+        if conn.isProd, !confirmed {
             let reasons = riskyReasons(q, kind: conn.kind)
             if !reasons.isEmpty {
                 pendingConfirm = PendingConfirm(title: "Run this on production \(conn.name)?", details: reasons, button: "Run on Production") { [weak self] in
@@ -249,8 +180,7 @@ enum LegacyMigration {
                 return
             }
         }
-        // A new result would silently drop unsaved edits.
-        guard edits.isEmpty else { error = "Save or discard \(editCount) unsaved change(s) first."; return }
+        guard !blockedByEdits() else { return }
         busy = true; error = nil
         // Rows are editable when the result is a sidebar browse, or a hand-written SELECT * of one table.
         let fromBrowse = browsed?.query == q
@@ -312,15 +242,22 @@ enum LegacyMigration {
     }
 
     /// Deletes rows by primary key after asking, then reloads the page.
+    /// A new result would silently drop unsaved edits: says so and returns true while there are any.
+    private func blockedByEdits() -> Bool {
+        guard !edits.isEmpty else { return false }
+        error = "Save or discard \(editCount) unsaved change(s) first."
+        return true
+    }
+
     // Limitation: one DELETE per row, not in a transaction.
     func deleteRows(_ rows: [Int]) {
         guard readOnlyReason == nil, let table, let q = browsed?.query else { return }
-        guard edits.isEmpty else { error = "Save or discard \(editCount) unsaved change(s) first."; return }
+        guard !blockedByEdits() else { return }
         let keys = rows.filter { $0 < result.rows.count }.sorted().map { r in
             primaryKey.map { k in (k, result.rows.cell(r, result.columns.firstIndex(of: k)!)) }
         }
         guard !keys.isEmpty else { return }
-        let n = keys.count, place = conn.isProduction == true ? " on production \(conn.name)" : ""
+        let n = keys.count, place = conn.onProduction
         pendingConfirm = PendingConfirm(title: "Delete \(n) row\(n == 1 ? "" : "s") from \(table)\(place)?",
                                         details: ["Rows are deleted by primary key. This can't be undone."], button: "Delete") { [weak self] in
             guard let self else { return }
@@ -354,7 +291,7 @@ enum LegacyMigration {
     /// Saves every edited row (one UPDATE per row). Rows that fail keep their edits.
     func saveAll(confirmed: Bool = false) {
         guard !saving, !edits.isEmpty else { return }
-        if conn.isProduction == true, !confirmed {
+        if conn.isProd, !confirmed {
             pendingConfirm = PendingConfirm(title: "Save \(editCount) change(s) to production \(conn.name)?",
                                             details: ["Rows are updated by primary key in \(table ?? "this table")."], button: "Save to Production") { [weak self] in
                 self?.saveAll(confirmed: true)
@@ -425,7 +362,7 @@ enum LegacyMigration {
     /// Header click: sort by that column, ascending first, then descending; back to the first page.
     func sort(by column: Int) {
         guard let table, let q = browsed?.query, column < result.columns.count, conn.kind != .redis else { return }
-        guard edits.isEmpty else { error = "Save or discard \(editCount) unsaved change(s) first."; return }
+        guard !blockedByEdits() else { return }
         let name = result.columns[column]
         let ascending = sortOrder.map { !($0.column == column && $0.ascending) } ?? true
         let quoted = conn.kind == .mysql ? MySQLDB.ident(name) : quoteIdent(name)

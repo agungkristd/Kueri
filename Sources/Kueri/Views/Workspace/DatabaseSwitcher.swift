@@ -1,46 +1,38 @@
+import AppKit
 import SwiftUI
 
-// MARK: Connection bar ("PostgreSQL 16.8 : local : shop : public.users")
-
-struct ConnectionBar: View {
-    let session: Session
-    /// White text on these meets WCAG AA (≈5:1); red marks a production connection.
-    static let normal = Color(red: 0.18, green: 0.45, blue: 0.27), production = Color(red: 0.70, green: 0.15, blue: 0.12)
-
-    private var object: String? {
-        let t: String? = switch session.kind {
-        case .data: session.table
-        case .structure(let n), .diagram(let n): n
-        }
-        guard let t else { return nil }
-        // Postgres tables in the default schema are listed bare; the bar always says which schema.
-        if session.conn.kind == .postgres, session.schemaOf(t) == "public", !t.hasPrefix("public.") { return "public." + t }
-        return t
-    }
-
+/// Toolbar button + searchable popover. Replaces a SwiftUI Picker whose 107-item menu was
+/// rebuilt on every state change (~250 ms main-thread stall per database switch, measured).
+/// The list is only built while the popover is open.
+struct DatabaseSwitcher: View {
+    @Bindable var session: Session
+    var newDatabase: () -> Void = {}
+    @State private var buttonHeight: CGFloat = 28
     var body: some View {
-        let parts = [session.serverVersion, session.conn.name, session.conn.kind == .sqlite ? "" : session.conn.database, object ?? ""]
-            .filter { !$0.isEmpty }
-        // Monospaced so identifiers read exactly as typed; small, not a "terminal" look.
-        Text(parts.joined(separator: " : "))
-            .font(.system(.callout, design: .monospaced))
-            .foregroundStyle(.white)
-            .lineLimit(1).truncationMode(.middle)
-            .padding(.horizontal, 12).padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 6).fill(session.conn.isProduction == true ? Self.production : Self.normal))
-            .help(parts.joined(separator: " : ") + (session.conn.isProduction == true ? " (production)" : ""))
+        Button { session.dbPicker.toggle() } label: {
+            HStack(spacing: 6) {
+                if session.switchingTo != nil { ProgressView().controlSize(.mini) } else { Image(systemName: "cylinder.split.1x2") }
+                Text(session.switchingTo ?? session.conn.database).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.up.chevron.down").font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.6)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Switch database (\(Keymap.shared.display(.switchDatabase)))")
+        .background(GeometryReader { g in Color.clear.onAppear { buttonHeight = g.size.height } })
+        // A dropdown hanging from the button, exactly as wide as it (not a popover).
+        .overlay(alignment: .top) {
+            if session.dbPicker { // read here only: a binding from WorkspaceView re-ran its whole body
+                DatabaseDropdown(session: session, newDatabase: newDatabase) { session.dbPicker = false }
+                    .offset(y: buttonHeight + 4)
+            }
+        }
     }
 }
-
-/// Search by words: every word of the query (split on spaces, `_`, `-`, `.`) appears in the text,
-/// in any order and case. "shop local" finds `shop_local`; an empty query matches everything.
-func nameMatches(_ query: String, _ text: String) -> Bool {
-    let words = query.lowercased().split(whereSeparator: { " _-.".contains($0) })
-    let t = text.lowercased()
-    return words.allSatisfy { t.contains($0) }
-}
-
-// MARK: Database dropdown (⌘K)
 
 struct DatabaseDropdown: View {
     @Bindable var session: Session
@@ -210,88 +202,4 @@ struct DatabaseList: NSViewRepresentable {
             t.scrollRowToVisible(i)
         }
     }
-}
-
-// MARK: History in the sidebar (per connection + database)
-
-struct HistorySidebar: View {
-    let history: QueryHistory
-    let conn: Conn
-    let use: (String) -> Void
-    @State private var search = ""
-    @State private var picked: HistoryEntry.ID?
-
-    private var mine: [HistoryEntry] {
-        history.entries.filter { e in
-            e.database == conn.database && (e.connectionID.map { $0 == conn.id } ?? (e.connection == conn.name))
-                && nameMatches(search, e.sql)
-        }
-    }
-    private var days: [(Date, [HistoryEntry])] {
-        Dictionary(grouping: mine) { Calendar.current.startOfDay(for: $0.date) }.sorted { $0.key > $1.key }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            TextField("Search history…", text: $search)
-                .textFieldStyle(.roundedBorder)
-                .padding(.horizontal, 10).padding(.vertical, 8)
-            if mine.isEmpty {
-                ContentUnavailableView(search.isEmpty ? "No history" : "No matches", systemImage: "clock.arrow.circlepath",
-                                       description: Text(search.isEmpty ? "Queries you run on \(conn.database.isEmpty ? conn.name : conn.database) appear here." : ""))
-                    .frame(maxHeight: .infinity)
-            } else {
-                List(selection: $picked) {
-                    ForEach(days, id: \.0) { day, entries in
-                        Section(day.formatted(date: .long, time: .omitted)) {
-                            ForEach(entries) { e in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 4) {
-                                        Text(e.date.formatted(date: .omitted, time: .standard)).font(.caption).foregroundStyle(.secondary)
-                                        if e.error != nil { Image(systemName: "exclamationmark.triangle.fill").font(.caption2).foregroundStyle(.red).help(e.error ?? "") }
-                                    }
-                                    Text(highlightSQL(e.sql)).font(.system(.callout, design: .monospaced)).lineLimit(4)
-                                }
-                                .padding(.vertical, 2)
-                                .tag(e.id)
-                            }
-                        }
-                    }
-                }
-                .listStyle(.sidebar)
-                .onChange(of: picked) { _, id in if let e = mine.first(where: { $0.id == id }) { use(e.sql) } }
-            }
-        }
-    }
-}
-
-/// Keywords, strings, numbers and comments coloured for read-only SQL (history list).
-func highlightSQL(_ sql: String) -> AttributedString {
-    var out = AttributedString()
-    let keywords = Set(SQLCompleter.sqlKeywords + SQLCompleter.redisCommands)
-    let chars = Array(sql)
-    var i = 0
-    func add(_ s: String, _ c: Color?) { var a = AttributedString(s); if let c { a.foregroundColor = c }; out += a }
-    while i < chars.count {
-        let c = chars[i]
-        if c == "'" || c == "\"" || c == "`" {
-            var j = i + 1
-            while j < chars.count, chars[j] != c { j += 1 }
-            j = min(j + 1, chars.count)
-            add(String(chars[i..<j]), c == "'" ? Color(nsColor: SQLHighlighter.string) : nil); i = j
-        } else if c == "-", i + 1 < chars.count, chars[i + 1] == "-" {
-            var j = i; while j < chars.count, chars[j] != "\n" { j += 1 }
-            add(String(chars[i..<j]), Color(nsColor: SQLHighlighter.comment)); i = j
-        } else if c.isLetter || c == "_" {
-            var j = i; while j < chars.count, chars[j].isLetter || chars[j].isNumber || chars[j] == "_" { j += 1 }
-            let w = String(chars[i..<j])
-            add(w, keywords.contains(w.uppercased()) ? Color(nsColor: SQLHighlighter.keyword) : nil); i = j
-        } else if c.isNumber {
-            var j = i; while j < chars.count, chars[j].isNumber || chars[j] == "." { j += 1 }
-            add(String(chars[i..<j]), Color(nsColor: SQLHighlighter.number)); i = j
-        } else {
-            add(String(c), nil); i += 1
-        }
-    }
-    return out
 }
