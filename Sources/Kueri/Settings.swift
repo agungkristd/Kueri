@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // MARK: Preferences
@@ -5,7 +6,7 @@ import SwiftUI
 /// User preferences (UserDefaults), read where they're used so a change applies on the next use.
 enum Prefs {
     static let pageSizeKey = "pageSize", maxRowsKey = "maxRows", timeoutKey = "queryTimeout"
-    static let gridFontKey = "gridFontSize", editorFontKey = "editorFontSize"
+    static let gridFontKey = "gridFontSize", editorFontKey = "editorFontSize", fontFamilyKey = "monoFontFamily"
     static let reopenTabsKey = "reopenTabs", newTabKey = "newTabOpens", saveHistoryKey = "saveHistory"
 
     private static func int(_ key: String, _ fallback: Int, _ range: ClosedRange<Int>) -> Int {
@@ -24,12 +25,27 @@ enum Prefs {
     /// ⌘T: "connection" opens a new window tab, "query" a new query tab in the current connection.
     static var newTabOpensQuery: Bool { UserDefaults.standard.string(forKey: newTabKey) == "query" }
     static var saveHistory: Bool { bool(saveHistoryKey, true) }
+    /// Font of the grid and the SQL editor; empty = the system's SF Mono.
+    static var fontFamily: String { UserDefaults.standard.string(forKey: fontFamilyKey) ?? "" }
+    static func mono(_ size: CGFloat) -> NSFont {
+        let f = fontFamily
+        return f.isEmpty ? .monospacedSystemFont(ofSize: size, weight: .regular)
+            : NSFontManager.shared.font(withFamily: f, traits: [], weight: 5, size: size) ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+    }
+    /// Installed fixed-width families, for the Settings picker (Core Text, off the main thread).
+    nonisolated static func monoFamilies() async -> [String] {
+        await Task.detached {
+            let mono = CTFontDescriptorCreateWithAttributes([kCTFontTraitsAttribute: [kCTFontSymbolicTrait: CTFontSymbolicTraits.traitMonoSpace.rawValue]] as CFDictionary)
+            let found = CTFontCollectionCreateMatchingFontDescriptors(CTFontCollectionCreateWithFontDescriptors([mono] as CFArray, nil)) as? [CTFontDescriptor] ?? []
+            return Set(found.compactMap { CTFontDescriptorCopyAttribute($0, kCTFontFamilyNameAttribute) as? String }.filter { !$0.hasPrefix(".") }).sorted()
+        }.value
+    }
 }
 
 // MARK: Keymap
 
 enum KeyAction: String, CaseIterable, Identifiable {
-    case run, stop, save, filterRows, toggleEditor, history, processes, toggleSidebar, toggleDetails, switchDatabase, newTab, renameConnection
+    case run, stop, save, filterRows, formatSQL, toggleEditor, history, processes, toggleSidebar, toggleDetails, switchDatabase, newTab, renameConnection
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -37,6 +53,7 @@ enum KeyAction: String, CaseIterable, Identifiable {
         case .stop: "Stop query"
         case .save: "Save changes"
         case .filterRows: "Filter result rows"
+        case .formatSQL: "Format SQL"
         case .toggleEditor: "Show / hide SQL editor"
         case .history: "Query history"
         case .processes: "Server processes"
@@ -49,7 +66,7 @@ enum KeyAction: String, CaseIterable, Identifiable {
     }
     var group: String {
         switch self {
-        case .run, .stop, .save, .filterRows, .toggleEditor: "Query"
+        case .run, .stop, .save, .filterRows, .formatSQL, .toggleEditor: "Query"
         case .history, .processes, .toggleSidebar, .toggleDetails: "View"
         case .switchDatabase, .newTab, .renameConnection: "Connection"
         }
@@ -60,11 +77,12 @@ enum KeyAction: String, CaseIterable, Identifiable {
         case .stop: Shortcut(key: ".", modifiers: [.command])
         case .save: Shortcut(key: "s", modifiers: [.command])
         case .filterRows: Shortcut(key: "f", modifiers: [.command])
+        case .formatSQL: Shortcut(key: "f", modifiers: [.command, .shift])
         case .toggleEditor: Shortcut(key: "e", modifiers: [.command, .shift])
         case .history: Shortcut(key: "y", modifiers: [.command])
         case .processes: Shortcut(key: "p", modifiers: [.command, .shift])
         case .toggleSidebar: Shortcut(key: "b", modifiers: [.command])
-        case .toggleDetails: Shortcut(key: "b", modifiers: [.command, .option])
+        case .toggleDetails: Shortcut(key: "b", modifiers: [.command, .shift])
         case .switchDatabase: Shortcut(key: "k", modifiers: [.command])
         case .newTab: Shortcut(key: "t", modifiers: [.command])
         case .renameConnection: Shortcut(key: "r", modifiers: [.command, .shift])
@@ -154,16 +172,69 @@ extension View {
 
 // MARK: Settings window (⌘,)
 
-struct SettingsView: View {
-    var body: some View {
-        TabView {
-            GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }
-            AppearanceSettings().tabItem { Label("Appearance", systemImage: "paintbrush") }
-            QuerySettings().tabItem { Label("Query", systemImage: "tablecells") }
-            PrivacySettings().tabItem { Label("Privacy", systemImage: "hand.raised") }
-            KeymapSettings().tabItem { Label("Keymap", systemImage: "keyboard") }
+/// Settings window with AppKit toolbar tabs, as Safari has. SwiftUI's Settings scene swapped each tab
+/// icon for a slightly different image while switching (24×24 → 25×23 and back, measured), and
+/// NSTabViewController re-attached the tab's form on every switch (30–150 ms each time). Here a tab is
+/// built on its first visit and afterwards only hidden and shown again.
+@MainActor final class SettingsWindow: NSObject, NSToolbarDelegate {
+    static let width: CGFloat = 560, height: CGFloat = 480
+    private static var shared: SettingsWindow?
+    static func show() {
+        if shared == nil { shared = SettingsWindow() }
+        shared!.window.makeKeyAndOrderFront(nil)
+    }
+
+    private struct Tab { let title: String, symbol: String, make: () -> NSView }
+    private let tabs: [Tab] = [
+        Tab(title: "General", symbol: "gearshape") { NSHostingView(rootView: GeneralSettings()) },
+        Tab(title: "Appearance", symbol: "paintbrush") { NSHostingView(rootView: AppearanceSettings()) },
+        Tab(title: "Query", symbol: "tablecells") { NSHostingView(rootView: QuerySettings()) },
+        Tab(title: "Privacy", symbol: "hand.raised") { NSHostingView(rootView: PrivacySettings()) },
+        Tab(title: "Keymap", symbol: "keyboard") { NSHostingView(rootView: KeymapSettings()) },
+    ]
+    private var built: [String: NSView] = [:]
+    private let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+                                  styleMask: [.titled, .closable], backing: .buffered, defer: true)
+
+    private override init() {
+        super.init()
+        let toolbar = NSToolbar(identifier: "settings")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconAndLabel
+        window.toolbar = toolbar
+        window.toolbarStyle = .preference
+        window.isReleasedWhenClosed = false
+        window.contentView = NSView()
+        select(tabs[0].title)
+        window.center()
+    }
+
+    private func select(_ title: String) {
+        window.toolbar?.selectedItemIdentifier = .init(title)
+        window.title = title
+        if built[title] == nil, let tab = tabs.first(where: { $0.title == title }), let content = window.contentView {
+            let v = tab.make()
+            v.frame = content.bounds
+            v.autoresizingMask = [.width, .height]
+            content.addSubview(v)
+            built[title] = v
         }
-        .frame(width: 560)
+        for (t, v) in built { v.isHidden = t != title }
+    }
+
+    @objc private func clicked(_ item: NSToolbarItem) { select(item.itemIdentifier.rawValue) }
+
+    func toolbarAllowedItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { tabs.map { .init($0.title) } }
+    func toolbarDefaultItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { tabs.map { .init($0.title) } }
+    func toolbarSelectableItemIdentifiers(_ t: NSToolbar) -> [NSToolbarItem.Identifier] { tabs.map { .init($0.title) } }
+    func toolbar(_ t: NSToolbar, itemForItemIdentifier id: NSToolbarItem.Identifier, willBeInsertedIntoToolbar: Bool) -> NSToolbarItem? {
+        guard let tab = tabs.first(where: { $0.title == id.rawValue }) else { return nil }
+        let item = NSToolbarItem(itemIdentifier: id)
+        item.label = tab.title
+        item.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: tab.title)
+        item.target = self
+        item.action = #selector(clicked(_:))
+        return item
     }
 }
 
@@ -190,6 +261,8 @@ private struct AppearanceSettings: View {
     @AppStorage(Appearance.key) private var appearance = Appearance.system.rawValue
     @AppStorage(Prefs.gridFontKey) private var gridFont = 12
     @AppStorage(Prefs.editorFontKey) private var editorFont = 13
+    @AppStorage(Prefs.fontFamilyKey) private var family = ""
+    @State private var families: [String] = []
     var body: some View {
         Form {
             Section {
@@ -201,14 +274,44 @@ private struct AppearanceSettings: View {
             } footer: {
                 Text("Also in View › Appearance (⌃⌘1, ⌃⌘2, ⌃⌘3).").font(.caption).foregroundStyle(.secondary)
             }
-            Section("Font size") {
+            Section("Data grid and SQL editor") {
+                Picker("Font", selection: $family) {
+                    Text("SF Mono (System)").tag("")
+                    ForEach(families, id: \.self) { Text($0).tag($0) }
+                }
                 Stepper("Data grid: \(gridFont) pt", value: $gridFont, in: 9...20)
                 Stepper("SQL editor: \(editorFont) pt", value: $editorFont, in: 9...24)
-                Text("SELECT * FROM users WHERE id = 1;")
-                    .font(.system(size: CGFloat(editorFont), design: .monospaced)).foregroundStyle(.secondary)
+                FontPreview(grid: CGFloat(gridFont), editor: CGFloat(editorFont))
+                    .id(family) // Prefs reads the stored family; redraw when it changes
             }
         }
         .formStyle(.grouped)
+        .task { families = await Prefs.monoFamilies().filter { $0 != "SF Mono" } } // took ~1 s on the main thread
+    }
+}
+
+/// How the grid and the editor will look with the chosen font and sizes.
+private struct FontPreview: View {
+    let grid: CGFloat, editor: CGFloat
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("SQL editor").font(.caption).foregroundStyle(.secondary).padding(.bottom, 4)
+            (Text("SELECT ").foregroundStyle(.blue) + Text("id, name ") + Text("FROM ").foregroundStyle(.blue)
+             + Text("users ") + Text("WHERE ").foregroundStyle(.blue) + Text("email = ") + Text("'a@b.co'").foregroundStyle(.red)
+             + Text(" -- 0O 1lI").foregroundStyle(.secondary))
+                .font(Font(Prefs.mono(editor)))
+                .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 4))
+            Text("Data grid").font(.caption).foregroundStyle(.secondary).padding(.top, 10).padding(.bottom, 4)
+            Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 2) {
+                GridRow { Text("id"); Text("name"); Text("created_at") }.foregroundStyle(.secondary)
+                GridRow { Text("1024"); Text("Ana"); Text("2026-10-19 08:30:00") }
+                GridRow { Text("1025"); Text("NULL").foregroundStyle(.tertiary); Text("2026-10-19 09:05:12") }
+            }
+            .font(Font(Prefs.mono(grid)))
+            .padding(8).frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .textBackgroundColor)).clipShape(RoundedRectangle(cornerRadius: 4))
+        }
     }
 }
 
@@ -322,7 +425,6 @@ private struct KeymapSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(height: 520)
         .onDisappear { stop() }
     }
 

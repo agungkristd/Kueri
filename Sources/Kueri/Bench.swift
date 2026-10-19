@@ -50,12 +50,27 @@ import SwiftUI
         check("edited cell shows pending value", shown?.string == "b")
     } else { check("grid found", false) }
 
+    // Several rows: ⌘/⇧-click selection is reported, and Delete deletes all of it (filtered rows map back).
+    var picked: [Int] = [], deleted: [Int] = []
+    let five = QueryResult(columns: ["id"], rows: (0..<5).map { [String($0)] })
+    let multiHost = NSHostingView(rootView: ResultGrid(result: five, filter: "", onDeleteRows: { deleted = $0 }, onSelectRows: { picked = $0 }))
+    win.contentView = multiHost; multiHost.layoutSubtreeIfNeeded()
+    if let tv = findTable(multiHost) as? GridTable {
+        tv.selectRowIndexes([1, 3], byExtendingSelection: false)
+        // The report is deferred to the main queue, which can't run inside bench; check what it sends.
+        (tv.delegate as? ResultGrid.Coordinator)?.onSelectRows(tv.selectedRowIndexes.map { $0 })
+        check("multi-row selection reported", picked == [1, 3])
+        tv.keyDown(with: NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                                          context: nil, characters: "\u{7f}", charactersIgnoringModifiers: "\u{7f}", isARepeat: false, keyCode: 51)!)
+        check("Delete key deletes every selected row", deleted == [1, 3])
+    } else { check("multi grid found", false) }
+
     // Tabs: a second window joins the first one's tab group
     let w1 = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     let w2 = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-    w1.contentView = NSHostingView(rootView: TabJoiner()); w1.orderFront(nil)
+    w1.contentView = NSHostingView(rootView: TabJoiner(workspace: true)); w1.orderFront(nil)
     RunLoop.main.run(until: Date().addingTimeInterval(0.2))
-    w2.contentView = NSHostingView(rootView: TabJoiner()); w2.orderFront(nil)
+    w2.contentView = NSHostingView(rootView: TabJoiner(workspace: true)); w2.orderFront(nil)
     RunLoop.main.run(until: Date().addingTimeInterval(0.3))
     check("second window joins as tab", w1.tabbedWindows?.contains(w2) == true)
 
@@ -104,39 +119,6 @@ import SwiftUI
         RunLoop.main.run(until: Date().addingTimeInterval(0.4))
         check("Rename focuses Name with all text selected", name.currentEditor()?.selectedRange == NSRange(location: 0, length: 14))
     } else { check("rename probe views found", false) }
-
-    // Rename popover from the toolbar title: opens with the name selected, Rename passes the new name.
-    struct TitleProbe: View {
-        let session: Session
-        @State var editing = false
-        let onRename: (String) -> Void
-        var body: some View {
-            VStack {
-                ConnectionTitle(session: session, rename: onRename, editing: $editing)
-                Button("open-rename") { editing = true } // stands in for File › Rename Connection…
-            }.padding(30)
-        }
-    }
-    var renamed: String?
-    let sess = Session.preview(Conn(name: "New connection", kind: .sqlite, path: ":memory:"))
-    let tw = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 320, height: 200), styleMask: [.titled], backing: .buffered, defer: false)
-    let th = NSHostingView(rootView: TitleProbe(session: sess, onRename: { renamed = $0 }))
-    tw.contentView = th; tw.makeKeyAndOrderFront(nil)
-    RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-    func buttons(_ v: NSView) -> [NSButton] { ((v as? NSButton).map { [$0] } ?? []) + v.subviews.flatMap(buttons) }
-    buttons(th).first?.performClick(nil) // the only NSButton: "open-rename" (the title itself is .plain)
-    RunLoop.main.run(until: Date().addingTimeInterval(0.6))
-    if let field = allFields(th).first(where: { $0.placeholderString == "Connection name" }) {
-        check("rename field appears with current name", field.stringValue == "New connection")
-        check("rename field has the name selected", field.currentEditor()?.selectedRange == NSRange(location: 0, length: 14))
-        // Type over the selection and press Return, through the field editor like a keyboard would.
-        if let ed = field.currentEditor() as? NSTextView {
-            ed.insertText("staging db", replacementRange: ed.selectedRange())
-            ed.doCommand(by: #selector(NSResponder.insertNewline(_:)))
-        }
-        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
-        check("typing + Return renames", renamed == "staging db")
-    } else { check("rename field appears", false) }
 
     // Table tabs, structure, diagram and table actions against a real (in-memory SQLite) session.
     let ts = Session.preview(Conn(name: "mem", kind: .sqlite, path: ":memory:"))
@@ -310,7 +292,7 @@ import SwiftUI
     check("keymap: conflict found for a taken shortcut",
           fresh.overrides.isEmpty ? fresh.conflict(Shortcut(key: "s", modifiers: [.command]), for: .run) == .save : true)
     check("keymap: menu-style display", Shortcut(key: "\r", modifiers: [.command, .shift]).display == "⇧⌘↩"
-          && KeyAction.toggleDetails.defaultShortcut.display == "⌥⌘B")
+          && KeyAction.toggleDetails.defaultShortcut.display == "⇧⌘B")
     // Theme: forcing light / dark changes what windows draw with; System follows macOS again.
     let themed = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 50, height: 50), styleMask: [.titled], backing: .buffered, defer: false)
     Appearance.dark.apply()

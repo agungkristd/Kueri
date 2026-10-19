@@ -185,12 +185,21 @@ final class MySQLDB: Database {
             FROM information_schema.columns
             WHERE table_schema = \(schema) AND table_name = \(name)
             ORDER BY ordinal_position
-            """).rows)
+            """).rows.map { $0 })
     }
 
     func update(_ t: String, set: [(String, String?)], key: [(String, String?)]) throws -> Int {
         try query("UPDATE \(qualified(t)) SET " + set.map { "\(Self.ident($0.0)) = \(Self.literal($0.1))" }.joined(separator: ", ")
             + " WHERE " + key.map { "\(Self.ident($0.0)) <=> \(Self.literal($0.1))" }.joined(separator: " AND ")).affected
+    }
+
+    func delete(_ t: String, key: [(String, String?)]) throws -> Int {
+        try query("DELETE FROM \(qualified(t)) WHERE "
+            + key.map { "\(Self.ident($0.0)) <=> \(Self.literal($0.1))" }.joined(separator: " AND ")).affected
+    }
+
+    func filterQuery(_ t: String, column: String, value: String) -> String {
+        "SELECT * FROM \(qualified(t)) WHERE \(Self.ident(column)) = \(Self.literal(value)) LIMIT \(pageSize)"
     }
 
     func query(_ sql: String) throws -> QueryResult {

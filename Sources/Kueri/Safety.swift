@@ -134,3 +134,58 @@ struct PendingConfirm: Identifiable {
     let button: String
     let action: () -> Void
 }
+
+/// A hand-written `SELECT * FROM one_table [WHERE …] [ORDER BY …] [LIMIT …] [OFFSET …]`. Its rows stay
+/// editable, and header sorting and paging rewrite it in place, so WHERE and ORDER BY are kept.
+enum SimpleSelect {
+    private static let part = #"(?:"[^"]+"|`[^`]+`|[A-Za-z_]\w*)"#
+    private static func clean(_ sql: String) -> String {
+        sql.trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ";")))
+    }
+    private static func match(_ pattern: String, _ s: String) -> NSTextCheckingResult? {
+        try! NSRegularExpression(pattern: pattern, options: .caseInsensitive).firstMatch(in: s, range: NSRange(s.startIndex..., in: s))
+    }
+
+    /// The table it reads (quotes removed), or nil when the query is anything more than that.
+    static func table(_ sql: String) -> String? {
+        let s = clean(sql)
+        guard !s.contains(";"),
+              let m = match(#"^select\s+\*\s+from\s+("# + part + #"(?:\."# + part + #")?)(?:\s+(?:where|order\s+by|limit|offset)\b[\s\S]*)?$"#, s),
+              let r = Range(m.range(at: 1), in: s) else { return nil }
+        let lower = s.lowercased()
+        guard !["join", "group by", "union", "having", "returning", "for update", "into"].contains(where: { lower.range(of: "\\b\($0)\\b", options: .regularExpression) != nil })
+        else { return nil }
+        return s[r].replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "`", with: "")
+    }
+
+    /// Sorted by `column` (already quoted), replacing any ORDER BY; LIMIT and OFFSET stay last.
+    static func sorted(_ sql: String, by column: String, ascending: Bool) -> String {
+        var s = clean(sql).replacingOccurrences(of: #"\s+order\s+by\s+[\s\S]*?(?=\s+limit\b|\s+offset\b|$)"#, with: "",
+                                                options: [.regularExpression, .caseInsensitive])
+        let order = " ORDER BY \(column) \(ascending ? "ASC" : "DESC")"
+        if let r = s.range(of: #"\s+(limit|offset)\b"#, options: [.regularExpression, .caseInsensitive]) { s.insert(contentsOf: order, at: r.lowerBound) }
+        else { s += order }
+        return s
+    }
+
+    /// Its ORDER BY when that is one column: the column (quotes removed) and direction.
+    static func sort(_ sql: String) -> (column: String, ascending: Bool)? {
+        let s = clean(sql)
+        guard let m = match(#"\border\s+by\s+("# + part + #")(?:\s+(asc|desc))?\s*(?:$|\blimit\b|\boffset\b)"#, s),
+              let c = Range(m.range(at: 1), in: s) else { return nil }
+        let dir = Range(m.range(at: 2), in: s).map { s[$0].lowercased() }
+        return (s[c].replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "`", with: ""), dir != "desc")
+    }
+
+    static func offset(_ sql: String) -> Int? {
+        let s = clean(sql)
+        return match(#"\boffset\s+(\d+)\s*$"#, s).flatMap { Range($0.range(at: 1), in: s) }.flatMap { Int(s[$0]) }
+    }
+
+    /// The same query on another page, or nil when it has no trailing OFFSET to change.
+    static func paged(_ sql: String, offset: Int) -> String? {
+        let s = clean(sql)
+        guard let m = match(#"\boffset\s+\d+\s*$"#, s), let r = Range(m.range, in: s) else { return nil }
+        return s.replacingCharacters(in: r, with: "OFFSET \(offset)")
+    }
+}

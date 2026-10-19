@@ -42,6 +42,7 @@ struct RowDetails: View {
     @State private var search = ""
     @State private var expanded: Set<Int> = []
     @State private var rawEditing: Set<Int> = [] // JSON fields switched to their raw, editable text
+    @State private var copied: Int?               // field whose value was just copied (brief checkmark)
 
     var body: some View {
         VStack(spacing: 0) {
@@ -114,11 +115,6 @@ struct RowDetails: View {
                             .padding(.bottom, 4)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    if editable {
-                        Button { rawEditing.insert(i) } label: { Image(systemName: "pencil") }
-                            .buttonStyle(.borderless)
-                            .help("Edit raw JSON (exactly as stored)")
-                    }
                 } else if editable {
                     TextField(isNull ? "NULL" : "", text: Binding(
                         get: { current ?? "" },
@@ -131,15 +127,6 @@ struct RowDetails: View {
                         .font(.system(.body, design: .monospaced))
                         .lineLimit(open ? 1...200 : 1...(json != nil ? 8 : 3))
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Menu {
-                        Button("Set NULL") { edits[i] = .some(nil) }.disabled(isNull)
-                        Button("Set empty string") { edits[i] = .some("") }
-                        if changed || rawEditing.contains(i) {
-                            Button("Revert") { edits.removeValue(forKey: i); rawEditing.remove(i) }
-                        }
-                    } label: { Image(systemName: "ellipsis.circle") }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-                    .help("NULL / revert")
                 } else {
                     Text(isNull ? AttributedString("NULL") : marked(AttributedString(text)))
                         .font(.system(.body, design: .monospaced))
@@ -148,12 +135,39 @@ struct RowDetails: View {
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                if multiline {
-                    Button { if open { expanded.remove(i) } else { expanded.insert(i) } } label: {
-                        Image(systemName: open ? "chevron.up" : "chevron.down")
+                // One row of same-sized plain icons: menu, edit JSON, copy, expand.
+                HStack(spacing: 2) {
+                    if editable && !jsonView {
+                        Menu {
+                            Button("Set NULL") { edits[i] = .some(nil) }.disabled(isNull)
+                            Button("Set empty string") { edits[i] = .some("") }
+                            if changed || rawEditing.contains(i) {
+                                Button("Revert") { edits.removeValue(forKey: i); rawEditing.remove(i) }
+                            }
+                        } label: { FieldIcon(name: "ellipsis") }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                        .help("NULL / revert")
                     }
+                    if editable && jsonView {
+                        Button { rawEditing.insert(i) } label: { FieldIcon(name: "pencil") }
+                            .buttonStyle(.borderless).help("Edit raw JSON (exactly as stored)")
+                    }
+                    // Copies the value as stored (raw JSON, not the formatted view).
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(current ?? "", forType: .string)
+                        copied = i
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { if copied == i { copied = nil } }
+                    } label: { FieldIcon(name: copied == i ? "checkmark" : "doc.on.doc") }
                     .buttonStyle(.borderless)
-                    .help(open ? "Collapse" : "Expand")
+                    .help(isNull ? "Copy (NULL copies nothing)" : "Copy value")
+                    if multiline {
+                        Button { if open { expanded.remove(i) } else { expanded.insert(i) } } label: {
+                            FieldIcon(name: open ? "chevron.up" : "chevron.down")
+                        }
+                        .buttonStyle(.borderless)
+                        .help(open ? "Collapse" : "Expand")
+                    }
                 }
             }
             .padding(.horizontal, 8)
@@ -219,4 +233,17 @@ func highlightJSON(_ s: String) -> AttributedString {
 
 extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+
+/// A field control's icon: same symbol size, weight, colour and box for every button in the row.
+struct FieldIcon: View {
+    let name: String
+    var body: some View {
+        Image(systemName: name)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            .frame(width: 20, height: 20)
+            .contentShape(Rectangle())
+    }
 }

@@ -53,6 +53,7 @@ extension Session {
     private func load(_ t: WorkTab) {
         activeTab = t.id; kind = t.kind; sql = t.sql; result = t.result; selectedRow = t.selectedRow; edits = t.edits
         table = t.table; primaryKey = t.primaryKey; browsed = t.browsed; offset = t.offset; error = t.error; diagram = t.diagram
+        selectedRows = []
     }
 
     /// Applies an async result to the tab that requested it, whether or not it is still active.
@@ -117,7 +118,14 @@ extension Session {
 
     /// The table plus every table linked to it by a foreign key, in either direction; an empty name
     /// is the whole database (current schema). An open diagram tab is reused rather than stacking tabs.
-    func showDiagram(_ name: String) {
+    /// `highlight` marks (and scrolls to) one table in the whole-database diagram; an open one is
+    /// reused, so moving the highlight doesn't reload or re-lay out anything.
+    func showDiagram(_ name: String, highlight: String? = nil) {
+        if name.isEmpty, case .diagram("") = kind, var whole = diagram, !whole.positions.isEmpty {
+            whole.highlight = highlight
+            diagram = whole
+            return
+        }
         let tab: UUID
         if case .diagram = kind, edits.isEmpty { kind = .diagram(name); diagram = nil; error = nil; tab = activeTab }
         else { tab = newTab(.diagram(name)) }
@@ -126,7 +134,11 @@ extension Session {
             do {
                 let model = try await onQueue { db -> DiagramModel in
                     let fks = try db.foreignKeys()
-                    if name.isEmpty { return try Self.wholeDiagram(db, tables: all, fks: fks) }
+                    if name.isEmpty {
+                        var whole = try Self.wholeDiagram(db, tables: all, fks: fks)
+                        whole.highlight = highlight
+                        return whole
+                    }
                     var names = [name]
                     for fk in fks {
                         if fk.fromTable == name, !names.contains(fk.toTable) { names.append(fk.toTable) }
@@ -428,253 +440,7 @@ struct StructureView: View {
     }
 }
 
-// MARK: Diagram tab
-
-struct DiagramTable: Identifiable, Hashable {
-    var id: String { name }
-    let name: String
-    let columns: [ColumnInfo]
-}
-
-/// Click-and-drag on the diagram background scrolls the enclosing scroll view.
-/// Table boxes sit above it, so dragging a box still moves the box.
-struct PanSurface: NSViewRepresentable {
-    final class View: NSView {
-        private var last: NSPoint?
-        override func mouseDown(with e: NSEvent) { last = e.locationInWindow }
-        override func mouseUp(with e: NSEvent) { last = nil }
-        override func mouseDragged(with e: NSEvent) {
-            guard let last, let sv = enclosingScrollView else { return }
-            let p = e.locationInWindow
-            pan(sv, dx: p.x - last.x, dy: p.y - last.y)
-            self.last = p
-        }
-        /// Content follows the pointer: moving right shows what's further left.
-        func pan(_ sv: NSScrollView, dx: CGFloat, dy: CGFloat) {
-            let clip = sv.contentView, doc = sv.documentView?.frame.size ?? .zero
-            var o = clip.bounds.origin
-            o.x -= dx
-            o.y += clip.isFlipped ? dy : -dy  // window y grows upwards
-            o.x = min(max(0, o.x), max(0, doc.width - clip.bounds.width))
-            o.y = min(max(0, o.y), max(0, doc.height - clip.bounds.height))
-            clip.scroll(to: o)
-            sv.reflectScrolledClipView(clip)
-        }
-    }
-    func makeNSView(context: Context) -> View { View() }
-    func updateNSView(_ v: View, context: Context) {}
-}
-
-struct DiagramModel {
-    let focus: String  // empty for the whole-database diagram
-    let tables: [DiagramTable]
-    let links: [ForeignKey]
-    var positions: [String: CGPoint] = [:]  // precomputed layout (whole database)
-}
-
-struct DiagramView: View {
-    let model: DiagramModel?
-    var error: String?
-    var structure: (String) async -> QueryResult? = { _ in nil }
-    var onAction: (TableAction, String) -> Void = { _, _ in }
-    var session: Session?  // enables column editing in the details popover
-    @State private var selected: String?
-    @State private var inspecting: String?
-    @State private var draft = TableDraft()    // lives here so an app switch doesn't lose it
-    @State private var reopen: String?         // popover closed by switching apps; shown again on return
-    @State private var pos: [String: CGPoint] = [:]
-    @State private var dragStart: [String: CGPoint] = [:]
-    @State private var zoom: CGFloat = 1
-    @State private var pinchStart: CGFloat?
-    @State private var viewport = CGSize(width: 800, height: 600)
-
-    static let width: CGFloat = 250, header: CGFloat = 34, row: CGFloat = 22, maxRows = 40
-    static let zoomRange: ClosedRange<CGFloat> = 0.2...2.5
-
-    private func setZoom(_ z: CGFloat) { zoom = min(max(z, Self.zoomRange.lowerBound), Self.zoomRange.upperBound) }
-
-    var body: some View {
-        if let model {
-            let size = canvasSize(model)
-            ScrollView([.horizontal, .vertical]) {
-                ZStack(alignment: .topLeading) {
-                    Canvas { ctx, _ in draw(model, in: &ctx) }
-                        .frame(width: size.width, height: size.height)
-                    PanSurface().frame(width: size.width, height: size.height) // drag on empty space scrolls
-                    ForEach(model.tables) { t in
-                        // One highlighted table: the clicked one, or the diagram's own table until then.
-                        box(t, selected: t.name == (selected ?? model.focus))
-                            .popover(isPresented: Binding(get: { inspecting == t.name }, set: { if !$0 { inspecting = nil } }),
-                                     arrowEdge: .trailing) {
-                                DiagramTableInfo(name: t.name, session: session, load: structure, draft: $draft) { action in
-                                    inspecting = nil; onAction(action, t.name)
-                                }
-                            }
-                            .onTapGesture(count: 2) { selected = t.name; inspecting = t.name }
-                            .onTapGesture { selected = t.name }
-                            .contextMenu {
-                                Button("Show Details") { selected = t.name; inspecting = t.name }
-                                Divider()
-                                Button("Open Data") { onAction(.openNewTab, t.name) }
-                                Button("Open Structure") { onAction(.structure, t.name) }
-                                Divider()
-                                Button("Delete Table…", role: .destructive) { onAction(.delete, t.name) }
-                            }
-                            .offset(x: point(t.name, model).x, y: point(t.name, model).y)
-                            .gesture(DragGesture()
-                                .onChanged { g in
-                                    NSCursor.closedHand.set()
-                                    let start = dragStart[t.name] ?? point(t.name, model)
-                                    dragStart[t.name] = start
-                                    pos[t.name] = CGPoint(x: max(0, start.x + g.translation.width), y: max(0, start.y + g.translation.height))
-                                }
-                                .onEnded { _ in dragStart[t.name] = nil; NSCursor.openHand.set() })
-                    }
-                }
-                .frame(width: size.width, height: size.height, alignment: .topLeading)
-                // Grab hand only over a table (it can be dragged); the plain arrow everywhere else.
-                .onContinuousHover { phase in
-                    guard case .active(let p) = phase else { NSCursor.arrow.set(); return }
-                    let overTable = model.tables.contains { t in
-                        CGRect(origin: point(t.name, model), size: CGSize(width: Self.width, height: Self.height(t))).contains(p)
-                    }
-                    (overTable ? NSCursor.openHand : NSCursor.arrow).set()
-                }
-                // Scaled drawing plus a frame of the scaled size, so scrolling covers the zoomed canvas.
-                .scaleEffect(zoom, anchor: .topLeading)
-                .frame(width: size.width * zoom, height: size.height * zoom, alignment: .topLeading)
-            }
-            .background(Color(nsColor: .underPageBackgroundColor))
-            .background(GeometryReader { g in Color.clear.onAppear { viewport = g.size }.onChange(of: g.size) { viewport = $1 } })
-            .background(ScrollModifierMonitor(zoom: { setZoom(zoom * $0) }))
-            .simultaneousGesture(MagnifyGesture()
-                .onChanged { g in
-                    let base = pinchStart ?? zoom
-                    pinchStart = base
-                    setZoom(base * g.magnification)
-                }
-                .onEnded { _ in pinchStart = nil })
-            .overlay(alignment: .bottomTrailing) {
-                HStack(spacing: 2) {
-                    Button { setZoom(zoom / 1.25) } label: { Image(systemName: "minus") }
-                        .keyboardShortcut("-", modifiers: .command).help("Zoom out (⌘−, or ⌃ + scroll)")
-                    Button { setZoom(1) } label: { Text("\(Int((zoom * 100).rounded()))%").monospacedDigit().frame(minWidth: 44) }
-                        .keyboardShortcut("0", modifiers: .command).help("Actual size (⌘0)")
-                    Button { setZoom(zoom * 1.25) } label: { Image(systemName: "plus") }
-                        .keyboardShortcut("=", modifiers: .command).help("Zoom in (⌘+, or ⌃ + scroll)")
-                    Button("Fit") { setZoom(min(viewport.width / size.width, viewport.height / size.height, 1)) }
-                        .help("Fit the whole diagram in the window")
-                }
-                .buttonStyle(.accessoryBarAction)
-                .padding(6)
-                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-                .padding(12)
-            }
-            .onChange(of: model.focus) { pos = [:]; zoom = 1; selected = nil; inspecting = nil }
-            .onChange(of: inspecting) { old, new in if let new, new != old, new != draft.table { draft = TableDraft(table: new) } }
-            // Popovers close when the app is deactivated (⌘-Tab); bring this one back on return.
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willResignActiveNotification)) { _ in reopen = inspecting }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                if let r = reopen, inspecting == nil { inspecting = r }
-                reopen = nil
-            }
-        } else if let error {
-            Text(error).foregroundStyle(.red).textSelection(.enabled).padding()
-        } else {
-            ProgressView("Loading diagram…").frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-
-    // Layout: tables the focus references on the right, tables referencing it on the left.
-    private func initial(_ name: String, _ m: DiagramModel) -> CGPoint {
-        if let p = m.positions[name] { return p }
-        let parents = m.tables.map(\.name).filter { n in n != m.focus && m.links.contains { $0.fromTable == m.focus && $0.toTable == n } }
-        let children = m.tables.map(\.name).filter { n in n != m.focus && !parents.contains(n) }
-        let gap: CGFloat = 120, x0: CGFloat = 40
-        func stackY(_ list: [String], _ n: String) -> CGFloat {
-            var y: CGFloat = 40
-            for other in list { if other == n { return y }; y += Self.height(m.tables.first { $0.name == other }!) + 40 }
-            return y
-        }
-        if name == m.focus { return CGPoint(x: x0 + Self.width + gap, y: 40) }
-        if let _ = parents.firstIndex(of: name) { return CGPoint(x: x0 + 2 * (Self.width + gap), y: stackY(parents, name)) }
-        return CGPoint(x: x0, y: stackY(children, name))
-    }
-    private func point(_ name: String, _ m: DiagramModel) -> CGPoint { pos[name] ?? initial(name, m) }
-
-    nonisolated static func height(_ t: DiagramTable) -> CGFloat {
-        Self.header + CGFloat(min(t.columns.count, Self.maxRows) + (t.columns.count > Self.maxRows ? 1 : 0)) * Self.row + 12
-    }
-
-    private func canvasSize(_ m: DiagramModel) -> CGSize {
-        var w: CGFloat = 800, h: CGFloat = 600
-        for t in m.tables {
-            let p = point(t.name, m)
-            w = max(w, p.x + Self.width + 80); h = max(h, p.y + Self.height(t) + 80)
-        }
-        return CGSize(width: w, height: h)
-    }
-
-    private func rowY(_ table: String, _ column: String, _ m: DiagramModel) -> CGFloat {
-        let t = m.tables.first { $0.name == table }!
-        let i = min(t.columns.firstIndex { $0.name == column } ?? 0, Self.maxRows) // hidden rows anchor to "more"
-        return point(table, m).y + Self.header + CGFloat(i) * Self.row + Self.row / 2
-    }
-
-    private func draw(_ m: DiagramModel, in ctx: inout GraphicsContext) {
-        for fk in m.links {
-            let a = point(fk.fromTable, m), b = point(fk.toTable, m)
-            let y1 = rowY(fk.fromTable, fk.fromColumn, m), y2 = rowY(fk.toTable, fk.toColumn, m)
-            let fromRight = a.x + Self.width <= b.x || (abs(a.x - b.x) < Self.width && fk.fromTable != fk.toTable)
-            let start = CGPoint(x: fromRight ? a.x + Self.width : a.x, y: y1)
-            let endOnLeft = fromRight ? (a.x + Self.width <= b.x) : false
-            let end = CGPoint(x: endOnLeft ? b.x : b.x + Self.width, y: y2)
-            let bend: CGFloat = 60
-            var path = Path()
-            path.move(to: start)
-            path.addCurve(to: end,
-                          control1: CGPoint(x: start.x + (fromRight ? bend : -bend), y: start.y),
-                          control2: CGPoint(x: end.x + (endOnLeft ? -bend : bend), y: end.y))
-            ctx.stroke(path, with: .color(.secondary), lineWidth: 2)
-            // arrowhead pointing into the referenced table
-            let dir: CGFloat = endOnLeft ? 1 : -1
-            var head = Path()
-            head.move(to: end)
-            head.addLine(to: CGPoint(x: end.x - dir * 9, y: end.y - 5))
-            head.addLine(to: CGPoint(x: end.x - dir * 9, y: end.y + 5))
-            head.closeSubpath()
-            ctx.fill(head, with: .color(.secondary))
-        }
-    }
-
-    private func box(_ t: DiagramTable, selected: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(t.name).font(.headline).lineLimit(1).frame(maxWidth: .infinity).frame(height: Self.header)
-            ForEach(t.columns.prefix(Self.maxRows), id: \.self) { c in
-                HStack(spacing: 6) {
-                    if c.isPrimaryKey { Image(systemName: "key.fill").font(.caption2).foregroundStyle(.yellow) }
-                    Text(c.name).lineLimit(1).truncationMode(.tail)
-                    Spacer(minLength: 8)
-                    Text(c.type).foregroundStyle(.secondary).lineLimit(1)
-                }
-                .font(.callout)
-                .frame(height: Self.row)
-            }
-            if t.columns.count > Self.maxRows {
-                Text("+ \(t.columns.count - Self.maxRows) more").font(.caption).foregroundStyle(.secondary).frame(height: Self.row)
-            }
-        }
-        .padding(.horizontal, 14).padding(.bottom, 12)
-        .frame(width: Self.width, height: Self.height(t), alignment: .top)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(selected ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: selected ? 2 : 1))
-        .contentShape(Rectangle())
-        .help("Double-click or right-click for details")
-    }
-}
-
-/// Popover for a table clicked in the diagram: its structure and the usual actions.
-/// Unsaved work in the details popover. Grid edits are keyed by row → result column; rows past the
+/// Unsaved work in the table details (right panel). Grid edits are keyed by row → result column; rows past the
 /// loaded ones are new (not yet created) columns / indexes.
 struct TableDraft {
     var table = ""
@@ -682,7 +448,6 @@ struct TableDraft {
     var newColumns = 0
     var indexEdits: [Int: [Int: String?]] = [:]
     var newIndexes = 0
-    var editing: (row: Int, old: ColumnDef, new: ColumnDef)?
     var isEmpty: Bool { columnEdits.isEmpty && newColumns == 0 && indexEdits.isEmpty && newIndexes == 0 }
 }
 
@@ -779,7 +544,7 @@ struct DiagramTableInfo: View {
             Group {
                 if showIndexes { indexGridView } else { structureGridView }
             }
-            .frame(height: 240)
+            .frame(minHeight: 180, maxHeight: .infinity) // fills the panel's height
             .clipShape(RoundedRectangle(cornerRadius: 6))
             if session != nil {
                 HStack(spacing: 6) {
@@ -790,42 +555,47 @@ struct DiagramTableInfo: View {
                         .help(showIndexes ? "Delete the selected index" : "Delete the selected column")
                         .disabled((showIndexes ? indexRow : row) == nil)
                     if !showIndexes {
-                        Button("Edit…") { if let row { openForm(row) } }.disabled(row.map { $0 >= baseColumns } ?? true)
                     }
-                    Text(showIndexes ? "New index: type a name, then pick its columns (in order), algorithm and unique."
-                                     : "Double-click a cell to edit it; type and NULL are picked from a menu.")
+                    Text(showIndexes ? "New index: name it, then pick its columns"
+                                     : "Double-click a cell to edit it")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                if let e = draft.editing, !showIndexes { editor(e) }
                 if !draft.isEmpty {
-                    HStack {
-                        let count = draft.columnEdits.keys.filter { $0 < baseColumns }.count + draft.newColumns
-                            + draft.newIndexes
-                        Text("\(count) unsaved change\(count == 1 ? "" : "s")").foregroundStyle(.secondary)
-                        if incomplete { Text("· new rows need a name\(showIndexes ? " and columns" : "")").font(.caption).foregroundStyle(.orange) }
-                        Spacer()
-                        Button("Discard") { discard() }
-                        Button("Save Changes…") { pending = ("Save changes to \(name)?", columnSQL + indexSQL) }
-                            .keyboardShortcut("s", modifiers: .command)
-                            .disabled((columnSQL + indexSQL).isEmpty || incomplete)
+                    // Two lines so it fits the narrowest panel.
+                    let count = draft.columnEdits.keys.filter { $0 < baseColumns }.count + draft.newColumns + draft.newIndexes
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("\(count) unsaved change\(count == 1 ? "" : "s")"
+                             + (incomplete ? " · new rows need a name\(showIndexes ? " and columns" : "")" : ""))
+                            .font(.callout).foregroundStyle(incomplete ? .orange : .secondary)
+                        HStack {
+                            Spacer()
+                            Button("Discard") { discard() }
+                            Button("Save…") { pending = ("Save changes to \(name)?", columnSQL + indexSQL) }
+                                .keyboardShortcut("s", modifiers: .command)
+                                .disabled((columnSQL + indexSQL).isEmpty || incomplete)
+                        }
                     }
                 }
             }
             if let error { Text(error).font(.callout).foregroundStyle(.red).textSelection(.enabled).lineLimit(6) }
             Divider()
             HStack {
-                Button("Delete Table…", role: .destructive) { action(.delete) }
+                Button("Open Data") { action(.openNewTab) }
                 Spacer()
-                Button("Open Structure") { action(.structure) }
-                Button("Open Data") { action(.openNewTab) }.keyboardShortcut(draft.editing == nil && draft.isEmpty ? .defaultAction : nil)
+                Menu {
+                    Button("Open Structure") { action(.structure) }
+                    Divider()
+                    Button("Delete Table…", role: .destructive) { action(.delete) }
+                } label: { FieldIcon(name: "ellipsis") }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .help("More table actions")
             }
         }
-        .padding(14)
-        .frame(width: 600)
+        .padding(12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .disabled(running)
         .task { await reload() }
         // With the form open, selecting another existing row edits that column instead.
-        .onChange(of: row) { _, r in if let r, r < baseColumns, let e = draft.editing, e.row != r, e.row >= 0 { openForm(r) } }
         .confirmationDialog(confirmTitle, isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             if let p = pending { Button(p.title.hasPrefix("Delete") ? "Delete" : "Save", role: .destructive) { apply(p.sql) } }
         } message: {
@@ -848,14 +618,14 @@ struct DiagramTableInfo: View {
                            c == nc || ((r >= baseColumns || kind != .sqlite) && c == dc)
                        },
                        editRequest: showIndexes ? nil : editRequest,
-                       onDoubleClick: { r, _ in if r < baseColumns { openForm(r) } },
                        menuForCell: { r, c in
                            let changeable = r >= baseColumns || kind != .sqlite
                            if c == tc, changeable { return ColumnType.names(kind) }
                            if c == nullc, changeable { return ["YES", "NO"] }
                            return nil
                        },
-                       editsOnSingleClick: { r in r >= baseColumns || draft.columnEdits[r] != nil })
+                       editsOnSingleClick: { r in r >= baseColumns || draft.columnEdits[r] != nil },
+                       hiddenColumns: col(result, "#").map { [$0] } ?? []) // the position adds nothing in a narrow panel
         } else { ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity) }
     }
 
@@ -914,7 +684,6 @@ struct DiagramTableInfo: View {
     }
 
     private func addColumn() {
-        draft.editing = nil
         draft.newColumns += 1
         rebuildGrids()
         let r = baseColumns + draft.newColumns - 1
@@ -959,74 +728,6 @@ struct DiagramTableInfo: View {
         draft = TableDraft(table: draft.table)
         row = nil; indexRow = nil
         rebuildGrids()
-    }
-
-    private func openForm(_ r: Int) {
-        guard session != nil, let c = column(r) else { return }
-        row = r; error = nil
-        draft.editing = (r, c, c)
-    }
-
-    @ViewBuilder private func editor(_ e: (row: Int, old: ColumnDef, new: ColumnDef)) -> some View {
-        let new = Binding(get: { draft.editing?.new ?? e.new }, set: { draft.editing?.new = $0 })
-        let type = Binding(get: { ColumnType(new.wrappedValue.type) }, set: { new.wrappedValue.type = $0.sql })
-        let isNew = e.row < 0
-        let sql = session.map { s in
-            isNew ? [Session.addColumnSQL(kind, table: s.quoteTable(name), column: new.wrappedValue)]
-                  : Session.alterColumnSQL(kind, table: s.quoteTable(name), from: e.old, to: new.wrappedValue)
-        } ?? []
-        let locked = kind == .sqlite && !isNew  // SQLite: rename only
-        let numeric = type.wrappedValue.base.contains("numeric") || type.wrappedValue.base.contains("decimal")
-        VStack(alignment: .leading, spacing: 10) {
-            Text(isNew ? "New Column" : "Edit Column \(e.old.name)").font(.headline)
-            // Labels right-aligned in one column, fields in the other.
-            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
-                GridRow {
-                    Text("Name").gridColumnAlignment(.trailing)
-                    TextField("Name", text: new.name, prompt: Text("column_name")).labelsHidden()
-                }
-                GridRow {
-                    Text("Type")
-                    HStack(spacing: 8) {
-                        Picker("Type", selection: type.base) {
-                            ForEach(ColumnType.choices(kind, current: e.old.type), id: \.self) { Text($0).tag($0) }
-                        }
-                        .labelsHidden().frame(width: 200)
-                        if type.wrappedValue.takesArguments {
-                            Text(numeric ? "Precision" : "Length").foregroundStyle(.secondary)
-                            TextField(numeric ? "Precision" : "Length", text: type.arguments, prompt: Text(numeric ? "10,2" : "255"))
-                                .labelsHidden().frame(width: 70)
-                                .help("Digits only, e.g. 255 or 10,2. Leave empty for no limit.")
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .disabled(locked)
-                }
-                GridRow {
-                    Text("Default")
-                    TextField("Default", text: new.defaultSQL, prompt: Text("none (SQL expression, e.g. 0 or now())")).labelsHidden().disabled(locked)
-                }
-                GridRow {
-                    Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
-                    Toggle("Allow NULL", isOn: new.nullable).disabled(locked)
-                }
-            }
-            if kind == .sqlite && !isNew { Text("SQLite can only rename a column; other changes need the table rebuilt.").font(.caption).foregroundStyle(.secondary) }
-            if !type.wrappedValue.argumentsValid { Text("Length must be digits, e.g. 255 or 10,2.").font(.caption).foregroundStyle(.red) }
-            Text(isNew && new.wrappedValue.name.isEmpty ? "Name the new column." : sql.isEmpty ? "No changes" : sql.joined(separator: ";\n") + ";")
-                .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
-            HStack {
-                Spacer()
-                Button("Cancel") { draft.editing = nil }.keyboardShortcut(.cancelAction)
-                Button(isNew ? "Add…" : "Apply…") {
-                    pending = (isNew ? "Add column \(new.wrappedValue.name) to \(name)?" : "Change column \(e.old.name) of \(name)?", sql)
-                }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(sql.isEmpty || new.wrappedValue.name.isEmpty || !type.wrappedValue.argumentsValid)
-            }
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.5)))
     }
 
     private func reload() async {
@@ -1150,43 +851,6 @@ struct ColumnDef: Equatable {
 }
 
 /// ⌃ + scroll zooms; ⇧ + scroll with a plain mouse wheel (vertical only) scrolls sideways.
-/// A local event monitor scoped to this view's frame, so other parts of the window aren't affected.
-struct ScrollModifierMonitor: NSViewRepresentable {
-    let zoom: (CGFloat) -> Void
-
-    final class V: NSView {
-        var zoom: (CGFloat) -> Void = { _ in }
-        private var monitor: Any?
-        override func viewDidMoveToWindow() {
-            if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
-            guard window != nil else { return }
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] e in
-                guard let self, e.window === self.window,
-                      self.bounds.contains(self.convert(e.locationInWindow, from: nil)) else { return e }
-                if e.modifierFlags.contains(.control) {
-                    let d = e.hasPreciseScrollingDeltas ? e.scrollingDeltaY / 200 : e.scrollingDeltaY / 20
-                    if d != 0 { self.zoom(1 + max(-0.5, min(0.5, d))) }
-                    return nil
-                }
-                if e.modifierFlags.contains(.shift), e.scrollingDeltaX == 0, e.scrollingDeltaY != 0,
-                   let cg = e.cgEvent?.copy() { // wheel mice only send vertical deltas
-                    cg.setIntegerValueField(.scrollWheelEventDeltaAxis2, value: cg.getIntegerValueField(.scrollWheelEventDeltaAxis1))
-                    cg.setIntegerValueField(.scrollWheelEventDeltaAxis1, value: 0)
-                    cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis2, value: cg.getDoubleValueField(.scrollWheelEventPointDeltaAxis1))
-                    cg.setDoubleValueField(.scrollWheelEventPointDeltaAxis1, value: 0)
-                    cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis2, value: cg.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1))
-                    cg.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: 0)
-                    return NSEvent(cgEvent: cg) ?? e
-                }
-                return e
-            }
-        }
-        deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
-    }
-    func makeNSView(context: Context) -> V { let v = V(); v.zoom = zoom; return v }
-    func updateNSView(_ v: V, context: Context) { v.zoom = zoom }
-}
-
 // MARK: Clone / Truncate / Delete sheets
 
 struct TableActionSheet: View {
@@ -1420,6 +1084,36 @@ struct NewSchemaSheet: View {
                 if what == .schema { try await session.createSchema(n) } else { try await session.createDatabase(n, open: openAfter) }
                 done()
             } catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
+
+/// Key to the line ends in the diagram, drawn against a table edge so it's clear which end is which.
+struct RelationLegend: View {
+    var body: some View {
+        HStack(spacing: 14) {
+            item("one (1)") { DiagramView.oneMark($0, at: CGPoint(x: 30, y: 9), outward: -1) }
+            item("many (N)") { DiagramView.manyMark($0, at: CGPoint(x: 30, y: 9), outward: -1) }
+            Text("Click a table to see its relations").foregroundStyle(.tertiary)
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .help("Each line joins a foreign key (the many end) to the row it references (the one end). Many-to-many relations go through a linking table, shown as two of these.")
+    }
+
+    private func item(_ label: String, _ mark: @escaping (CGMutablePath) -> Void) -> some View {
+        HStack(spacing: 5) {
+            Canvas { ctx, _ in
+                let line = CGMutablePath(); line.move(to: CGPoint(x: 0, y: 9)); line.addLine(to: CGPoint(x: 30, y: 9))
+                mark(line)
+                ctx.stroke(Path(line), with: .color(.secondary), lineWidth: 1.4)
+                // The table edge the mark touches.
+                ctx.fill(Path(roundedRect: CGRect(x: 30, y: 1, width: 3, height: 16), cornerRadius: 1), with: .color(.secondary.opacity(0.6)))
+            }
+            .frame(width: 34, height: 18)
+            Text(label)
         }
     }
 }

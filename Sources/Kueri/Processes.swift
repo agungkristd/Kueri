@@ -91,6 +91,15 @@ struct ProcessListSheet: View {
         }
     }
     private var selected: ServerProcess? { rows.first { $0.id == picked } }
+    /// Rows for the grid; rebuilt only when what it shows changes.
+    @State private var grid = QueryResult()
+    private func rebuildGrid() {
+        let r = shown.map { p -> [String?] in
+            [p.id, p.user, p.database, p.isOwn ? "\(p.client) (Kueri, this tab)" : p.client, p.state, p.duration, p.query]
+        }
+        guard !(grid.rows == r) else { return }
+        grid = QueryResult(columns: ["ID", "User", "Database", "Client", "State", "Time", "Query"], rows: r)
+    }
 
     var body: some View {
         VStack(spacing: 10) {
@@ -104,22 +113,13 @@ struct ProcessListSheet: View {
                 Button { refresh() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Refresh").keyboardShortcut("r", modifiers: .command).disabled(loading)
             }
-            Table(shown, selection: $picked) {
-                TableColumn("ID") { p in Text(p.id).fontWeight(p.isOwn ? .semibold : .regular) }.width(min: 50, ideal: 60, max: 90)
-                TableColumn("User", value: \.user).width(min: 60, ideal: 90)
-                TableColumn("Database", value: \.database).width(min: 60, ideal: 110)
-                TableColumn("Client") { p in Text(p.isOwn ? "\(p.client) (Kueri, this tab)" : p.client) }.width(min: 80, ideal: 150)
-                TableColumn("State", value: \.state).width(min: 60, ideal: 110)
-                TableColumn("Time", value: \.duration).width(min: 50, ideal: 70, max: 90)
-                TableColumn("Query") { p in Text(p.query).font(.system(.body, design: .monospaced)).lineLimit(1).help(p.query) }
-            }
-            .contextMenu(forSelectionType: ServerProcess.ID.self) { ids in
-                if let p = rows.first(where: { $0.id == ids.first }) {
-                    Button("Copy Query") { copy(p.query) }.disabled(p.query.isEmpty)
-                    if canCancelQuery { Button("Cancel Query…") { confirm = (p, true) }.disabled(p.isOwn) }
-                    Button("Kill Connection…") { confirm = (p, false) }.disabled(p.isOwn)
-                }
-            }
+            // The app's AppKit grid: a SwiftUI Table made opening and closing this sheet sluggish.
+            // Right-click copies a value or the whole row.
+            ResultGrid(result: grid, selection: Binding(
+                get: { shown.firstIndex { $0.id == picked } },
+                set: { picked = $0.flatMap { shown.indices.contains($0) ? shown[$0].id : nil } }),
+                keepPosition: true)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             if let error { Text(error).foregroundStyle(.red).font(.callout).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled) }
             HStack {
                 if session.busy { Text("Waiting for this tab's running query to finish…").foregroundStyle(.secondary).font(.callout) }
@@ -138,6 +138,9 @@ struct ProcessListSheet: View {
         }
         .padding(16)
         .frame(minWidth: 860, minHeight: 460)
+        .onChange(of: rows) { rebuildGrid() }
+        .onChange(of: search) { rebuildGrid() }
+        .onChange(of: hideIdle) { rebuildGrid() }
         .task(id: auto) {
             refresh()
             while auto, !Task.isCancelled {
@@ -181,5 +184,4 @@ struct ProcessListSheet: View {
         }
     }
 
-    private func copy(_ s: String) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(s, forType: .string) }
 }

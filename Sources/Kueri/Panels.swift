@@ -70,20 +70,12 @@ struct DatabaseDropdown: View {
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
             Divider()
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(filtered, id: \.self) { db in row(db).id(db) }
-                        if filtered.isEmpty {
-                            Text("No databases match “\(search)”").foregroundStyle(.secondary).padding(.vertical, 10)
-                        }
-                    }
-                    .padding(4)
-                }
-                .onChange(of: highlighted) { _, h in if let h { proxy.scrollTo(h) } }
-                .onAppear { proxy.scrollTo(session.conn.database, anchor: .center) }
+            if filtered.isEmpty {
+                Text("No databases match “\(search)”").foregroundStyle(.secondary).padding(.vertical, 10)
+            } else {
+                DatabaseList(items: filtered, current: session.conn.database, highlighted: $highlighted, pick: open)
+                    .frame(height: min(CGFloat(filtered.count) * DatabaseList.rowHeight + 8, 340))
             }
-            .frame(maxHeight: 340)
             Divider()
             Button { close(); newDatabase() } label: {
                 Label("New Database…", systemImage: "plus").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
@@ -110,22 +102,6 @@ struct DatabaseDropdown: View {
         .onDisappear { monitor.map(NSEvent.removeMonitor); monitor = nil }
     }
 
-    private func row(_ db: String) -> some View {
-        Button { open(db) } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "cylinder.split.1x2").foregroundStyle(.tint)
-                Text(db).lineLimit(1).truncationMode(.middle)
-                Spacer()
-                if db == session.conn.database { Image(systemName: "checkmark").font(.caption).foregroundStyle(.secondary) }
-            }
-            .padding(.horizontal, 8).padding(.vertical, 5)
-            .background(RoundedRectangle(cornerRadius: 5).fill(db == highlighted ? Color.accentColor.opacity(0.35) : .clear))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { if $0 { highlighted = db } }
-    }
-
     private func move(_ step: Int) {
         let list = filtered
         guard !list.isEmpty else { return }
@@ -134,6 +110,106 @@ struct DatabaseDropdown: View {
     }
 
     private func open(_ db: String) { close(); if db != session.conn.database { session.switchDatabase(db) } }
+}
+
+/// The dropdown's rows in an NSTableView, which only makes the visible ones: as SwiftUI rows all
+/// 107 databases were built on every open (~230 ms, measured).
+struct DatabaseList: NSViewRepresentable {
+    static let rowHeight: CGFloat = 26
+    let items: [String]
+    let current: String
+    @Binding var highlighted: String?
+    let pick: (String) -> Void
+
+    final class Table: NSTableView {
+        var hover: (Int) -> Void = { _ in }
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .activeInActiveApp, .inVisibleRect], owner: self))
+        }
+        override func mouseMoved(with e: NSEvent) { hover(row(at: convert(e.locationInWindow, from: nil))) }
+    }
+
+    final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+        var parent: DatabaseList
+        let icon = NSImage(systemSymbolName: "cylinder.split.1x2", accessibilityDescription: nil)
+        let check = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Current database")
+        var syncing = false
+        init(_ p: DatabaseList) { parent = p }
+        func numberOfRows(in t: NSTableView) -> Int { parent.items.count }
+        func tableView(_ t: NSTableView, viewFor col: NSTableColumn?, row: Int) -> NSView? {
+            let cell = t.makeView(withIdentifier: .init("db"), owner: nil) as? NSTableCellView ?? makeCell()
+            let db = parent.items[row]
+            cell.textField?.stringValue = db
+            cell.toolTip = db
+            (cell.subviews.last as? NSImageView)?.image = db == parent.current ? check : nil
+            return cell
+        }
+        private func makeCell() -> NSTableCellView {
+            let c = NSTableCellView(); c.identifier = .init("db")
+            let iv = NSImageView(image: icon ?? NSImage()), tf = NSTextField(labelWithString: ""), mark = NSImageView()
+            iv.contentTintColor = .controlAccentColor
+            mark.contentTintColor = .secondaryLabelColor
+            tf.lineBreakMode = .byTruncatingMiddle
+            tf.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            [iv, tf, mark].forEach { $0.translatesAutoresizingMaskIntoConstraints = false; c.addSubview($0) }
+            NSLayoutConstraint.activate([
+                iv.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 6), iv.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                tf.leadingAnchor.constraint(equalTo: iv.trailingAnchor, constant: 8), tf.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+                mark.leadingAnchor.constraint(greaterThanOrEqualTo: tf.trailingAnchor, constant: 6),
+                mark.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -8), mark.centerYAnchor.constraint(equalTo: c.centerYAnchor),
+            ])
+            c.textField = tf; c.imageView = iv
+            return c
+        }
+        func tableViewSelectionDidChange(_ n: Notification) {
+            guard !syncing, let t = n.object as? NSTableView, t.selectedRow >= 0 else { return }
+            parent.highlighted = parent.items[t.selectedRow]
+        }
+        @objc func clicked(_ t: NSTableView) { if t.clickedRow >= 0 { parent.pick(parent.items[t.clickedRow]) } }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let t = Table()
+        t.headerView = nil
+        t.rowHeight = Self.rowHeight
+        t.style = .inset
+        t.backgroundColor = .clear
+        t.focusRingType = .none
+        t.refusesFirstResponder = true // typing stays in the search field
+        t.addTableColumn(NSTableColumn(identifier: .init("db")))
+        t.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        t.dataSource = context.coordinator
+        t.delegate = context.coordinator
+        t.target = context.coordinator
+        t.action = #selector(Coordinator.clicked(_:))
+        t.hover = { [weak t] row in // hover highlights, like a menu
+            guard let t, row >= 0, t.selectedRow != row else { return }
+            t.selectRowIndexes([row], byExtendingSelection: false)
+        }
+        let sv = FillScrollView()
+        sv.documentView = t
+        sv.hasVerticalScroller = true
+        sv.autohidesScrollers = true
+        sv.drawsBackground = false
+        return sv
+    }
+
+    func updateNSView(_ sv: NSScrollView, context: Context) {
+        let c = context.coordinator, old = c.parent.items
+        c.parent = self
+        guard let t = sv.documentView as? NSTableView else { return }
+        if old != items || t.numberOfRows != items.count { t.reloadData() }
+        if let h = highlighted, let i = items.firstIndex(of: h), t.selectedRow != i {
+            c.syncing = true
+            t.selectRowIndexes([i], byExtendingSelection: false)
+            c.syncing = false
+            t.scrollRowToVisible(i)
+        }
+    }
 }
 
 // MARK: History in the sidebar (per connection + database)
@@ -202,17 +278,17 @@ func highlightSQL(_ sql: String) -> AttributedString {
             var j = i + 1
             while j < chars.count, chars[j] != c { j += 1 }
             j = min(j + 1, chars.count)
-            add(String(chars[i..<j]), c == "'" ? Color(nsColor: .systemRed) : Color(nsColor: .systemPink)); i = j
+            add(String(chars[i..<j]), c == "'" ? Color(nsColor: SQLHighlighter.string) : nil); i = j
         } else if c == "-", i + 1 < chars.count, chars[i + 1] == "-" {
             var j = i; while j < chars.count, chars[j] != "\n" { j += 1 }
-            add(String(chars[i..<j]), .secondary); i = j
+            add(String(chars[i..<j]), Color(nsColor: SQLHighlighter.comment)); i = j
         } else if c.isLetter || c == "_" {
             var j = i; while j < chars.count, chars[j].isLetter || chars[j].isNumber || chars[j] == "_" { j += 1 }
             let w = String(chars[i..<j])
-            add(w, keywords.contains(w.uppercased()) ? Color(nsColor: .systemBlue) : nil); i = j
+            add(w, keywords.contains(w.uppercased()) ? Color(nsColor: SQLHighlighter.keyword) : nil); i = j
         } else if c.isNumber {
             var j = i; while j < chars.count, chars[j].isNumber || chars[j] == "." { j += 1 }
-            add(String(chars[i..<j]), Color(nsColor: .systemPurple)); i = j
+            add(String(chars[i..<j]), Color(nsColor: SQLHighlighter.number)); i = j
         } else {
             add(String(c), nil); i += 1
         }

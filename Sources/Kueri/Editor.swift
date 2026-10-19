@@ -11,8 +11,28 @@ import SwiftUI
     GROUP BY ORDER HAVING LIMIT OFFSET ASC DESC UNION ALL INSERT INTO VALUES UPDATE SET DELETE RETURNING WITH \
     CREATE ALTER DROP TRUNCATE TABLE INDEX VIEW COLUMN ADD PRIMARY KEY FOREIGN REFERENCES DEFAULT UNIQUE CHECK CONSTRAINT \
     CASE WHEN THEN ELSE END CAST COALESCE NULLIF COUNT SUM AVG MIN MAX NOW CURRENT_DATE CURRENT_TIMESTAMP TRUE FALSE \
-    BEGIN COMMIT ROLLBACK EXPLAIN ANALYZE SHOW DESCRIBE INTERVAL LATERAL OVER PARTITION WINDOW
+    BEGIN COMMIT ROLLBACK EXPLAIN ANALYZE SHOW DESCRIBE INTERVAL LATERAL OVER PARTITION WINDOW \
+    REPLACE FUNCTION PROCEDURE RETURNS LANGUAGE TRIGGER SCHEMA DATABASE SEQUENCE IF CASCADE RESTRICT \
+    MATERIALIZED REFRESH GRANT REVOKE TO TEMPORARY
     """.split(separator: " ").map(String.init)
+    /// Whether the end of `before` is inside a 'string' or a comment (no completion there).
+    nonisolated static func insideLiteral(_ before: String) -> Bool {
+        var inString = false, lineComment = false, blockComment = false
+        let c = Array(before.utf16)
+        var i = 0
+        while i < c.count {
+            let ch = c[i], next = i + 1 < c.count ? c[i + 1] : 0
+            if lineComment { if ch == 10 { lineComment = false } }
+            else if blockComment { if ch == 42 && next == 47 { blockComment = false; i += 1 } }
+            else if inString { if ch == 39 { if next == 39 { i += 1 } else { inString = false } } }
+            else if ch == 39 { inString = true }
+            else if ch == 45 && next == 45 { lineComment = true; i += 1 }
+            else if ch == 47 && next == 42 { blockComment = true; i += 1 }
+            i += 1
+        }
+        return inString || lineComment || blockComment
+    }
+
     nonisolated static let redisCommands = """
     GET SET DEL EXISTS EXPIRE TTL KEYS SCAN TYPE RENAME INCR DECR APPEND MGET MSET \
     HGET HSET HGETALL HDEL HKEYS HVALS HSCAN LPUSH RPUSH LPOP RPOP LRANGE LLEN SADD SREM SMEMBERS SSCAN SCARD \
@@ -20,13 +40,15 @@ import SwiftUI
     """.split(separator: " ").map(String.init)
 
     /// Tables referenced by the query, plus alias → table (`FROM users u`, `JOIN orders AS o`).
+    /// Quoted names (`"public"."users"`, `` `shop`.`orders` ``) come back without their quotes.
     nonisolated static func referencedTables(_ sql: String) -> (tables: [String], aliases: [String: String]) {
-        let re = try! NSRegularExpression(pattern: #"\b(?:from|join|update|into|table)\s+([A-Za-z_][\w.]*)(?:\s+(?:as\s+)?([A-Za-z_]\w*))?"#,
+        let part = #"(?:"[^"]+"|`[^`]+`|[A-Za-z_][\w]*)"#
+        let re = try! NSRegularExpression(pattern: #"\b(?:from|join|update|into|table)\s+("# + part + #"(?:\."# + part + #")*)(?:\s+(?:as\s+)?([A-Za-z_]\w*))?"#,
                                           options: [.caseInsensitive])
         var tables: [String] = [], aliases: [String: String] = [:]
         let ns = sql as NSString
         for m in re.matches(in: sql, range: NSRange(location: 0, length: ns.length)) {
-            let t = ns.substring(with: m.range(at: 1))
+            let t = ns.substring(with: m.range(at: 1)).replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "`", with: "")
             if !tables.contains(t) { tables.append(t) }
             if m.range(at: 2).location != NSNotFound {
                 let a = ns.substring(with: m.range(at: 2))
@@ -34,6 +56,14 @@ import SwiftUI
             }
         }
         return (tables, aliases)
+    }
+
+    /// The sidebar's name for a table written in the query: tables in the default schema are listed
+    /// without it, so `public.users` is `users`.
+    private func listed(_ t: String) -> String {
+        if session.tables.contains(t) { return t }
+        let last = t.split(separator: ".").last.map(String.init) ?? t
+        return session.tables.contains(last) ? last : t
     }
 
     /// Candidates for the word being typed. `word` may be qualified (`u.na`, `users.na`).
@@ -44,10 +74,10 @@ import SwiftUI
         if parts.count >= 2 { // qualified: columns of that table/alias
             let qualifier = parts.dropLast().joined(separator: ".")
             let table = aliases[qualifier.lowercased()] ?? session.tables.first { $0.caseInsensitiveCompare(qualifier) == .orderedSame } ?? qualifier
-            return (session.completionColumns(table) ?? []).map(\.name)
+            return (session.completionColumns(listed(table)) ?? []).map(\.name)
         }
         if redis { return Self.redisCommands + session.tables }
-        let columns = refs.flatMap { session.completionColumns($0)?.map(\.name) ?? [] }
+        let columns = refs.flatMap { session.completionColumns(listed($0))?.map(\.name) ?? [] }
         // Right after FROM / JOIN / UPDATE / INTO a table name is the likely next word.
         let lastWord = before.split(whereSeparator: { !$0.isLetter && $0 != "_" }).last?.uppercased() ?? ""
         if ["FROM", "JOIN", "UPDATE", "INTO", "TABLE"].contains(lastWord) { return session.tables + Self.sqlKeywords }
@@ -98,9 +128,24 @@ struct SQLEditor: NSViewRepresentable {
             } else {
                 rect = lm.extraLineFragmentRect
             }
-            let attrs: [NSAttributedString.Key: Any] = [.font: font ?? .monospacedSystemFont(ofSize: 13, weight: .regular),
-                                                        .foregroundColor: NSColor.tertiaryLabelColor]
-            (ghost as NSString).draw(at: NSPoint(x: rect.minX + textContainerOrigin.x, y: rect.minY + textContainerOrigin.y), withAttributes: attrs)
+            let s = string as NSString
+            let font = font ?? Prefs.mono(Prefs.editorFontSize)
+            let origin = NSPoint(x: rect.minX + textContainerOrigin.x, y: rect.minY + textContainerOrigin.y)
+            // Text after the caret on this line would hide an inline suggestion: show it in a chip under the caret.
+            if caret < s.length, s.character(at: caret) != 10, let word = pending?.replacement {
+                let text = NSMutableAttributedString(string: word, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+                text.append(NSAttributedString(string: "  ⇥", attributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor]))
+                let size = text.size()
+                var at = NSPoint(x: origin.x - (word.utf16.count - ghost.utf16.count > 0 ? (word as NSString).size(withAttributes: [.font: font]).width - (ghost as NSString).size(withAttributes: [.font: font]).width : 0),
+                                 y: origin.y + rect.height + 3)
+                if at.y + size.height + 2 > visibleRect.maxY { at.y = origin.y - size.height - 5 } // last visible line: above it
+                let chip = NSBezierPath(roundedRect: NSRect(origin: at, size: size).insetBy(dx: -5, dy: -2), xRadius: 4, yRadius: 4)
+                NSColor.controlBackgroundColor.setFill(); chip.fill()
+                NSColor.separatorColor.setStroke(); chip.stroke()
+                text.draw(at: at)
+                return
+            }
+            (ghost as NSString).draw(at: origin, withAttributes: [.font: font, .foregroundColor: NSColor.tertiaryLabelColor])
         }
 
         /// The identifier-ish word ending at the caret (letters, digits, `_`, `.`).
@@ -113,7 +158,29 @@ struct SQLEditor: NSViewRepresentable {
             var start = caret.location
             while start > 0, let c = Unicode.Scalar(s.character(at: start - 1)),
                   CharacterSet.alphanumerics.contains(c) || c == "_" || c == "." { start -= 1 }
-            return start < caret.location ? NSRange(location: start, length: caret.location - start) : nil
+            guard start < caret.location else { return nil }
+            // Typing inside a 'string' or a comment is data, not a name: no suggestion.
+            if SQLCompleter.insideLiteral(s.substring(to: start)) { return nil }
+            return NSRange(location: start, length: caret.location - start)
+        }
+
+        /// Beautifies the whole query as one undoable edit.
+        @objc func formatSQL(_ sender: Any?) {
+            let formatted = SQLFormatter.format(string)
+            let all = NSRange(location: 0, length: (string as NSString).length)
+            guard formatted != string, shouldChangeText(in: all, replacementString: formatted) else { return }
+            textStorage?.replaceCharacters(in: all, with: formatted)
+            didChangeText()
+            setSelectedRange(NSRange(location: (formatted as NSString).length, length: 0))
+        }
+
+        override func menu(for event: NSEvent) -> NSMenu? {
+            let menu = super.menu(for: event) ?? NSMenu()
+            let item = NSMenuItem(title: "Format SQL", action: #selector(formatSQL(_:)), keyEquivalent: "")
+            item.target = self
+            menu.insertItem(item, at: 0)
+            menu.insertItem(.separator(), at: 1)
+            return menu
         }
 
         func refreshGhost() {
@@ -189,7 +256,7 @@ struct SQLEditor: NSViewRepresentable {
         tv.isVerticallyResizable = true
         tv.minSize = old.minSize; tv.maxSize = old.maxSize
         sv.documentView = tv
-        tv.font = .monospacedSystemFont(ofSize: Prefs.editorFontSize, weight: .regular)
+        tv.font = Prefs.mono(Prefs.editorFontSize)
         tv.isRichText = false
         tv.allowsUndo = true
         tv.isAutomaticQuoteSubstitutionEnabled = false
@@ -211,7 +278,8 @@ struct SQLEditor: NSViewRepresentable {
     func updateNSView(_ sv: NSScrollView, context: Context) {
         context.coordinator.parent = self
         guard let tv = sv.documentView as? TextView else { return }
-        if tv.font?.pointSize != Prefs.editorFontSize { tv.font = .monospacedSystemFont(ofSize: Prefs.editorFontSize, weight: .regular) }
+        let font = Prefs.mono(Prefs.editorFontSize)
+        if tv.font != font { tv.font = font; SQLHighlighter.apply(to: tv) } // changed in Settings
         let c = completer
         tv.suggest = { w, sql, before in c.best(for: w, in: sql, before: before) }
         tv.list = { w, sql, before in c.candidates(for: w, in: sql, before: before) }
@@ -238,9 +306,22 @@ extension Session {
 
 /// Syntax colours for the editor, applied as layout-manager temporary attributes: the text, its
 /// undo history and what gets run are untouched. Same palette as the history list.
+/// Muted on purpose: identifiers (most of a query) keep the normal text colour, and the few
+/// coloured kinds are desaturated so nothing glares on a dark background; light mode uses darker
+/// tones of the same hues for contrast.
 enum SQLHighlighter {
-    static let keyword = NSColor.systemBlue, string = NSColor.systemRed, identifier = NSColor.systemPink
-    static let number = NSColor.systemPurple, comment = NSColor.secondaryLabelColor, type = NSColor.systemTeal
+    private static func tone(light: UInt32, dark: UInt32) -> NSColor {
+        func c(_ v: UInt32) -> NSColor {
+            NSColor(srgbRed: CGFloat(v >> 16 & 0xFF) / 255, green: CGFloat(v >> 8 & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+        }
+        return NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? c(dark) : c(light) }
+    }
+    static let keyword = tone(light: 0x2F5D93, dark: 0x82A9D9)    // soft blue
+    static let string = tone(light: 0x8A6418, dark: 0xC9A86B)     // turmeric, from the app's palette
+    static let number = tone(light: 0x6E4AA0, dark: 0xB49ED6)     // faded violet
+    static let type = tone(light: 0x2B7364, dark: 0x79B4A6)       // faded teal
+    static let comment = tone(light: 0x7A808A, dark: 0x7F8790)
+    static let identifier = NSColor.textColor                     // quoted names read as plain text
     // Limitation: re-colours the whole text on each change; fine for editor-sized SQL, skipped above 200 KB
     static let maxLength = 200_000
 
@@ -269,7 +350,8 @@ enum SQLHighlighter {
                 var j = i + 1
                 while j < n { if ch(j) == c { if ch(j + 1) == c { j += 2; continue }; break }; j += 1 }
                 j = min(j + 1, n)
-                out.append((NSRange(location: i, length: j - i), c == 39 ? string : identifier)); i = j
+                if c == 39 { out.append((NSRange(location: i, length: j - i), string)) } // quoted names stay plain
+                i = j
             } else if c >= 48 && c <= 57, i == 0 || !isWord(ch(i - 1)) {
                 var j = i; while j < n, (ch(j) >= 48 && ch(j) <= 57) || ch(j) == 46 { j += 1 }
                 out.append((NSRange(location: i, length: j - i), number)); i = j

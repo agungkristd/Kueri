@@ -6,9 +6,99 @@ struct QueryResult {
     var id = UUID() // lets the grid skip reloads when nothing new arrived; renew after edits
     var columns: [String] = []
     var types: [String] = [] // per column; may be empty (e.g. Redis)
-    var rows: [[String?]] = []
+    var rows = Rows()
     var message = ""
     var affected = 0
+}
+
+extension QueryResult {
+    init(id: UUID = UUID(), columns: [String] = [], types: [String] = [], rows: [[String?]], message: String = "", affected: Int = 0) {
+        self.init(id: id, columns: columns, types: types, rows: Rows(rows), message: message, affected: affected)
+    }
+}
+
+/// Result rows in one block of memory: every cell's UTF-8 bytes back to back, an end offset per
+/// cell and a NULL bit per cell. An array of `String?` per row costs 16 bytes a cell plus a heap
+/// block for every value longer than 15 bytes; this is the text itself plus about 4 bytes a cell.
+/// Reads build the `String` on demand (`cell(_:_:)` for one value, `self[r]` for a row).
+struct Rows: RandomAccessCollection, Equatable, ExpressibleByArrayLiteral {
+    private var bytes: [UInt8] = []
+    private var ends: [UInt32] = []      // cell i is bytes[ends[i - 1] ..< ends[i]]
+    private var nulls: [UInt64] = []     // bit i set: cell i is NULL
+    private var rowStarts: [UInt32] = [] // first cell of each row (rows may differ in width)
+
+    init() {}
+    init(_ rows: [[String?]]) { for r in rows { append(r) } }
+    init(arrayLiteral rows: [String?]...) { self.init(rows) }
+
+    var startIndex: Int { 0 }
+    var endIndex: Int { rowStarts.count }
+
+    private func cellRange(_ row: Int) -> Range<Int> {
+        Int(rowStarts[row]) ..< (row + 1 < rowStarts.count ? Int(rowStarts[row + 1]) : ends.count)
+    }
+    /// Number of cells in a row.
+    func width(_ row: Int) -> Int { cellRange(row).count }
+
+    /// One value without building the whole row; nil for NULL or a column the row doesn't have.
+    func cell(_ row: Int, _ column: Int) -> String? {
+        let cells = cellRange(row)
+        guard column >= 0, column < cells.count else { return nil }
+        let i = cells.lowerBound + column
+        if nulls[i >> 6] & (1 << UInt64(i & 63)) != 0 { return nil }
+        let a = i == 0 ? 0 : Int(ends[i - 1]), b = Int(ends[i])
+        return bytes.withUnsafeBufferPointer { String(decoding: UnsafeBufferPointer(rebasing: $0[a..<b]), as: UTF8.self) }
+    }
+
+    subscript(row: Int) -> [String?] {
+        get { (0..<width(row)).map { cell(row, $0) } }
+        set { replace(row, with: newValue) }
+    }
+
+    /// Splices the row's bytes in place (same width: the usual cell edit); otherwise rebuilds.
+    /// Either way the layout stays canonical, so == can compare storage.
+    private mutating func replace(_ row: Int, with values: [String?]) {
+        let cells = cellRange(row)
+        guard values.count == cells.count else {
+            var copy = Rows()
+            for r in indices { copy.append(r == row ? values : self[r]) }
+            self = copy
+            return
+        }
+        guard !cells.isEmpty else { return }
+        let a = cells.lowerBound == 0 ? 0 : Int(ends[cells.lowerBound - 1]), b = Int(ends[cells.upperBound - 1])
+        var new: [UInt8] = [], newEnds: [UInt32] = []
+        for (k, v) in values.enumerated() {
+            let i = cells.lowerBound + k, bit: UInt64 = 1 << UInt64(i & 63)
+            if let v { new.append(contentsOf: v.utf8); nulls[i >> 6] &= ~bit } else { nulls[i >> 6] |= bit }
+            newEnds.append(UInt32(a + new.count))
+        }
+        bytes.replaceSubrange(a..<b, with: new)
+        ends.replaceSubrange(cells, with: newEnds)
+        let shift = Int64(new.count) - Int64(b - a)
+        if shift != 0 { for i in cells.upperBound..<ends.count { ends[i] = UInt32(Int64(ends[i]) + shift) } }
+    }
+
+    mutating func append(_ row: [String?]) {
+        appendRow(row.count) { i, add in if let v = row[i] { var v = v; v.withUTF8 { add($0) } } }
+    }
+
+    /// Appends a row of `count` cells. `fill(i, add)` calls `add` with cell i's bytes, or doesn't
+    /// call it for NULL; drivers hand over their buffers this way without making Strings.
+    mutating func appendRow(_ count: Int, _ fill: (Int, (UnsafeBufferPointer<UInt8>) -> Void) -> Void) {
+        rowStarts.append(UInt32(ends.count))
+        for i in 0..<count {
+            var present = false
+            fill(i) { b in bytes.append(contentsOf: b); present = true }
+            let cell = ends.count
+            if cell >> 6 >= nulls.count { nulls.append(0) }
+            if !present { nulls[cell >> 6] |= 1 << UInt64(cell & 63) }
+            ends.append(UInt32(bytes.count))
+        }
+    }
+
+    static func += (lhs: inout Rows, rhs: [[String?]]) { for r in rhs { lhs.append(r) } }
+    static func == (lhs: Rows, rhs: [[String?]]) -> Bool { lhs == Rows(rhs) }
 }
 
 // Limitation: results capped in memory, add paging (LIMIT/OFFSET) if you need to scroll millions of rows
@@ -51,6 +141,10 @@ protocol Database: AnyObject {
     /// `UPDATE table SET … WHERE key…` with values passed safely (bound or hex-encoded).
     /// Returns the number of rows matched.
     func update(_ table: String, set: [(String, String?)], key: [(String, String?)]) throws -> Int
+    /// `DELETE FROM table WHERE key…`, values passed like `update`. Returns the number of rows deleted.
+    func delete(_ table: String, key: [(String, String?)]) throws -> Int
+    /// Browse query for the rows whose `column` equals `value` (following a foreign key).
+    func filterQuery(_ table: String, column: String, value: String) -> String
 }
 
 extension Database {
@@ -73,6 +167,12 @@ extension Database {
     func quoteTable(_ table: String) -> String { quoteIdent(table) }
     func update(_ table: String, set: [(String, String?)], key: [(String, String?)]) throws -> Int {
         throw DBError("Editing is not supported for this database")
+    }
+    func delete(_ table: String, key: [(String, String?)]) throws -> Int {
+        throw DBError("Deleting rows is not supported for this database")
+    }
+    func filterQuery(_ table: String, column: String, value: String) -> String {
+        "SELECT * FROM \(quoteTable(table)) WHERE \(quoteIdent(column)) = '\(value.replacingOccurrences(of: "'", with: "''"))' LIMIT \(pageSize)"
     }
     func firstColumn(_ sql: String) throws -> [String] { try query(sql).rows.compactMap { $0.first ?? nil } }
 }
@@ -210,13 +310,21 @@ final class SQLiteDB: Database {
     }
 
     func update(_ t: String, set: [(String, String?)], key: [(String, String?)]) throws -> Int {
-        let sql = "UPDATE \(quote(table: t)) SET " + set.map { "\(quoteIdent($0.0)) = ?" }.joined(separator: ", ")
-            + " WHERE " + key.map { "\(quoteIdent($0.0)) IS ?" }.joined(separator: " AND ")
+        try exec("UPDATE \(quote(table: t)) SET " + set.map { "\(quoteIdent($0.0)) = ?" }.joined(separator: ", ")
+            + " WHERE " + key.map { "\(quoteIdent($0.0)) IS ?" }.joined(separator: " AND "), set.map(\.1) + key.map(\.1))
+    }
+
+    func delete(_ t: String, key: [(String, String?)]) throws -> Int {
+        try exec("DELETE FROM \(quote(table: t)) WHERE " + key.map { "\(quoteIdent($0.0)) IS ?" }.joined(separator: " AND "), key.map(\.1))
+    }
+
+    /// One statement with bound values; returns the rows changed.
+    private func exec(_ sql: String, _ params: [String?]) throws -> Int {
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw DBError(String(cString: sqlite3_errmsg(db))) }
         defer { sqlite3_finalize(stmt) }
         let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-        for (i, v) in (set.map(\.1) + key.map(\.1)).enumerated() {
+        for (i, v) in params.enumerated() {
             // Explicit byte length: values may contain NUL, which -1 ("until NUL") would cut off.
             if let v { sqlite3_bind_text(stmt, Int32(i + 1), v, Int32(v.utf8.count), transient) } else { sqlite3_bind_null(stmt, Int32(i + 1)) }
         }
@@ -254,15 +362,16 @@ final class SQLiteDB: Database {
                 if rc == SQLITE_DONE { break }
                 guard rc == SQLITE_ROW else { throw DBError(String(cString: sqlite3_errmsg(db))) }
                 if cur.rows.count >= maxRows { cur.message = "Showing first \(maxRows) rows"; break }
-                cur.rows.append((0..<n).map { i in
+                cur.rows.appendRow(Int(n)) { i, add in
+                    let i = Int32(i)
                     switch sqlite3_column_type(s, i) {
-                    case SQLITE_NULL: return nil
-                    case SQLITE_BLOB: return "<blob \(sqlite3_column_bytes(s, i)) bytes>"
+                    case SQLITE_NULL: break
+                    case SQLITE_BLOB: var t = "<blob \(sqlite3_column_bytes(s, i)) bytes>"; t.withUTF8 { add($0) }
                     default: // by byte count, not C string: text containing NUL must survive intact
                         let n = Int(sqlite3_column_bytes(s, i))
-                        return String(decoding: UnsafeBufferPointer(start: sqlite3_column_text(s, i), count: n), as: UTF8.self)
+                        add(UnsafeBufferPointer(start: sqlite3_column_text(s, i), count: n))
                     }
-                })
+                }
             }
             if n > 0 { res = cur } else { res.message = "\(sqlite3_changes(db)) row(s) affected" }
         }
@@ -379,7 +488,13 @@ final class PostgresDB: Database {
                 }
                 total += Int(nt)
                 for t in 0..<nt where cur!.rows.count < maxRows {
-                    cur!.rows.append((0..<nf).map { PQgetisnull(r, t, $0) == 1 ? nil : String(cString: PQgetvalue(r, t, $0)) })
+                    cur!.rows.appendRow(Int(nf)) { i, add in // libpq's own buffers, no String per cell
+                        let f = Int32(i)
+                        guard PQgetisnull(r, t, f) == 0 else { return }
+                        PQgetvalue(r, t, f).withMemoryRebound(to: UInt8.self, capacity: 1) {
+                            add(UnsafeBufferPointer(start: $0, count: Int(PQgetlength(r, t, f))))
+                        }
+                    }
                 }
                 if PQresultStatus(r) == PGRES_TUPLES_OK { // end of this statement's rows
                     if total > maxRows { cur!.message = "Showing first \(maxRows) of \(total) rows" }
@@ -456,6 +571,13 @@ final class PostgresDB: Database {
         let sql = "UPDATE \(quote(table: t)) SET " + set.map { "\(quoteIdent($0.0)) = \(p())" }.joined(separator: ", ")
             + " WHERE " + key.map { "\(quoteIdent($0.0)) IS NOT DISTINCT FROM \(p())" }.joined(separator: " AND ")
         return try execParams(sql, set.map(\.1) + key.map(\.1)).affected
+    }
+
+    func delete(_ t: String, key: [(String, String?)]) throws -> Int {
+        var n = 0
+        let sql = "DELETE FROM \(quote(table: t)) WHERE "
+            + key.map { n += 1; return "\(quoteIdent($0.0)) IS NOT DISTINCT FROM $\(n)" }.joined(separator: " AND ")
+        return try execParams(sql, key.map(\.1)).affected
     }
 
     /// Parameters go over the wire separately from the SQL text (no quoting/injection issues).
@@ -551,6 +673,25 @@ func selfTest() {
     assert(st.columns == ["#", "column_name", "data_type", "is_nullable", "column_default", "primary_key"])
     assert(st.rows == [["1", "id", "INTEGER", "YES", nil, "YES"], ["2", "name", "TEXT", "NO", "'x'", ""]])
     assert(try! db.foreignKeys() == [ForeignKey(fromTable: "child", fromColumn: "parent_id", toTable: "parent", toColumn: "id")])
+    // Following a foreign key finds the parent row (quotes in values are escaped); delete goes by key.
+    _ = try! db.query("INSERT INTO parent(id, name) VALUES (1, 'a'), (2, 'it''s')")
+    assert(try! db.query(db.filterQuery("parent", column: "name", value: "it's")).rows == [["2", "it's"]])
+    assert(try! db.delete("parent", key: [("id", "1")]) == 1 && db.delete("parent", key: [("id", "1")]) == 0)
+    assert(try! db.query("SELECT id FROM parent").rows == [["2"]])
+    _ = try! db.query("DELETE FROM parent")
+    // Hand-written single-table queries: detected, sorted in place (WHERE and paging kept), paged.
+    let q1 = #"SELECT * FROM "public"."lesson_schedules" order by 1 desc LIMIT 100 OFFSET 0"#
+    assert(SimpleSelect.table(q1) == "public.lesson_schedules")
+    assert(SimpleSelect.table("select * from users where name = 'x';") == "users")
+    for q in ["SELECT id FROM users", "SELECT * FROM a JOIN b ON true", "SELECT * FROM a, b", "SELECT * FROM a GROUP BY id",
+              "SELECT * FROM a; DELETE FROM a", "SELECT * FROM a UNION SELECT * FROM b"] { assert(SimpleSelect.table(q) == nil, q) }
+    let s1 = SimpleSelect.sorted(q1, by: #""id""#, ascending: true)
+    assert(s1 == #"SELECT * FROM "public"."lesson_schedules" ORDER BY "id" ASC LIMIT 100 OFFSET 0"#, s1)
+    assert(SimpleSelect.sort(s1)! == ("id", true))
+    assert(SimpleSelect.sort(SimpleSelect.sorted(s1, by: "`id`", ascending: false))! == ("id", false))
+    assert(SimpleSelect.sorted("SELECT * FROM t WHERE a = 1", by: "a", ascending: false) == "SELECT * FROM t WHERE a = 1 ORDER BY a DESC")
+    assert(SimpleSelect.paged(s1, offset: 200) == #"SELECT * FROM "public"."lesson_schedules" ORDER BY "id" ASC LIMIT 100 OFFSET 200"#)
+    assert(SimpleSelect.offset("SELECT * FROM t LIMIT 100 OFFSET 300;") == 300 && SimpleSelect.paged("SELECT * FROM t", offset: 1) == nil)
     assert(db.quoteTable(#"we"ird"#) == #""we""ird""#)
     // Structure view keeps the table's own column order (not alphabetical).
     _ = try! db.query("CREATE TABLE ord(zeta TEXT, alpha INTEGER PRIMARY KEY, mid TEXT)")
@@ -671,13 +812,41 @@ func selfTest() {
     let hl = SQLHighlighter.ranges("SELECT \"id\", 'a''b' FROM t WHERE n = 42 -- note\nCREATE TABLE x (id bigserial)" as NSString)
     let kinds = hl.map { $0.1 }
     assert(kinds.filter { $0 == SQLHighlighter.keyword }.count == 5, "\(hl)")
-    assert(kinds.contains(SQLHighlighter.identifier) && kinds.contains(SQLHighlighter.number) && kinds.contains(SQLHighlighter.type))
+    assert(!kinds.contains(SQLHighlighter.identifier) && kinds.contains(SQLHighlighter.number) && kinds.contains(SQLHighlighter.type))
     assert(hl.contains { $0.1 == SQLHighlighter.string && $0.0.length == 6 } && hl.contains { $0.1 == SQLHighlighter.comment })
     // Result filter: every word somewhere in the row, any case; nil when empty.
     let fr = QueryResult(columns: ["id", "name"], rows: [["1", "Class 1-A"], ["2", "Kelas 1"], ["3", nil]])
     assert(ResultGrid.matching(fr, "") == nil && ResultGrid.matching(fr, "class 1-a") == [0] && ResultGrid.matching(fr, "1") == [0, 1])
     assert(Session.isLocalNetwork("192.168.1.20") && Session.isLocalNetwork("nas.local") && Session.isLocalNetwork("172.20.0.5"))
     assert(!Session.isLocalNetwork("172.40.0.1") && !Session.isLocalNetwork("db.example.com") && !Session.isLocalNetwork("8.8.8.8"))
+    // Beautify: clause keywords on their own lines, content indented; strings and comments untouched.
+    func fmt(_ q: String, _ want: String) { let got = SQLFormatter.format(q); assert(got == want, "\n" + got) }
+    fmt("select * from \"public\".\"assets\" limit 300 offset 0",
+        "SELECT\n  *\nFROM\n  \"public\".\"assets\"\nLIMIT\n  300\nOFFSET\n  0")
+    fmt("select * from assets where name ilike '%te st%' and id between 1 and 9 order by id",
+        "SELECT\n  *\nFROM\n  assets\nWHERE\n  name ILIKE '%te st%'\n  AND id BETWEEN 1 AND 9\nORDER BY\n  id")
+    fmt("select o.id, count(*) from orders o left join users u on u.id = o.user_id group by o.id",
+        "SELECT\n  o.id,\n  COUNT(*)\nFROM\n  orders o\n  LEFT JOIN users u ON u.id = o.user_id\nGROUP BY\n  o.id")
+    fmt("create table t (id bigserial primary key, name text default 'a, b')",
+        "CREATE TABLE t (\n  id bigserial PRIMARY KEY,\n  name text DEFAULT 'a, b'\n)")
+    fmt("insert into notes (id) values (1), (2)", "INSERT INTO\n  notes (id)\nVALUES\n  (1),\n  (2)")
+    fmt("select 1; -- keep me\nselect x::int from t", "SELECT\n  1;\n\n-- keep me\nSELECT\n  x::int\nFROM\n  t")
+    fmt("create or replace function f() returns int as $$ select 1; $$ language sql",
+        "CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ select 1; $$ LANGUAGE sql")
+    // No completion inside strings or comments.
+    assert(SQLCompleter.insideLiteral("SELECT * FROM t WHERE a ILIKE '%te") && SQLCompleter.insideLiteral("SELECT 1 -- us"))
+    assert(SQLCompleter.referencedTables(#"SELECT * FROM "public"."ai_events" where ty"#).tables == ["public.ai_events"])
+    var rows: Rows = [["1", nil, "é"], [nil], [], ["x", "yy"]]
+    assert(rows.count == 4 && rows.cell(0, 2) == "é" && rows.cell(0, 1) == nil && rows.cell(1, 0) == nil && rows.width(2) == 0 && rows.cell(9 - 9, 7) == nil)
+    rows[0][1] = "two"; rows[3][0] = nil // same width: spliced in place
+    assert(rows == [["1", "two", "é"], [nil], [], [nil, "yy"]])
+    rows[1] = ["a", "b"] // new width: rebuilt
+    assert(rows == [["1", "two", "é"], ["a", "b"], [], [nil, "yy"]] && rows.map { $0.count } == [3, 2, 0, 2])
+    var big = Rows(); for i in 0..<200 { big.append([String(i), i % 3 == 0 ? nil : "v\(i)"]) }
+    big[100][1] = "changed"
+    assert(big.cell(100, 1) == "changed" && big.cell(101, 1) == "v101" && big.cell(99, 1) == nil && big.cell(199, 0) == "199")
+    assert(SQLCompleter.referencedTables("SELECT * FROM `shop`.`orders` o").aliases["o"] == "shop.orders")
+    assert(!SQLCompleter.insideLiteral("SELECT * FROM t WHERE a = 'x' AND us") && !SQLCompleter.insideLiteral("SELECT 'it''s' FROM us"))
     print("selftest ok")
 }
 

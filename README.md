@@ -26,9 +26,14 @@
 
 - A native grid that stays fast with hundreds of columns and thousands of rows, 300 rows per page.
 - Double-click a cell to edit it; changed rows are tinted until you save them by primary key (⌘S).
+  Results of a hand-written `SELECT * FROM one_table …` are editable too.
+- Delete one or several rows (⌘- or ⇧-click, then Delete), after a confirmation.
+- Click a column header to sort; the query is rewritten to `ORDER BY` that column, ascending then
+  descending.
+- Foreign-key cells have an arrow that opens the referenced table, filtered to that row.
 - A row details panel with JSON formatting and search.
 - Tables, structure views and diagrams open side by side in tabs; every connection gets its own
-  window tab (⌘T), and tabs reconnect after a restart.
+  window tab (⌘T), and tabs reconnect after a restart. Drag connections to reorder them.
 - A connection bar shows server version, connection, database and table, in red for production.
 
 ### Write queries
@@ -72,7 +77,7 @@
 
 ### Make it yours
 
-Settings (⌘,) holds the theme (System, Light, Dark), grid and editor font sizes, rows per page,
+Settings (⌘,) holds the theme (System, Light, Dark), the grid and editor font with a preview, rows per page,
 the result row limit, a server-side query timeout, startup behaviour, history privacy and a
 keymap where every shortcut can be changed.
 
@@ -129,8 +134,8 @@ PostgreSQL client tools, OpenSSL and MIT Kerberos under their own permissive lic
 
 ## Limitations
 
-- Saved passwords are stored unencrypted in the app's preferences file (readable only by your user
-  account). The app is ad-hoc signed, and Keychain re-prompts on every rebuild of such apps.
+- Saved passwords are stored unencrypted in the app's preferences file
+  (`~/Library/Preferences/app.kueri.plist`, readable only by your user account), not in the Keychain.
 - For MySQL 8 servers that require full `caching_sha2_password` authentication, use TLS Verify, or
   enable "Allow public key retrieval" on the connection. It is off by default, because without a
   verified certificate the password or the server's key could be intercepted on the network.
@@ -146,9 +151,15 @@ PostgreSQL client tools, OpenSSL and MIT Kerberos under their own permissive lic
   not saved to the query history.
 - Result sets are capped in memory (10,000 rows by default, see Settings). Postgres streams rows, so
   large results don't exhaust memory.
+- The result filter (⌘F) searches the rows already loaded (the current page or result), not the
+  whole table; use a WHERE clause for that.
+- Syntax colours are skipped for SQL longer than 200 KB, to keep the editor responsive.
 - The query timeout applies to PostgreSQL and MySQL (SELECT only), not to SQLite or Redis, and to
   connections opened after it's set.
 - Redis values are read-only.
+- Deleting several rows runs one DELETE per row, not in a transaction; a failure part-way leaves
+  the rows before it deleted.
+- A foreign key over several columns is followed by the clicked column only.
 - The release DMG is built for Intel Macs (Apple silicon runs it through Rosetta) and isn't notarized,
   so macOS asks you to allow it once (see [Install](#install)).
 - The `pg_restore` bundled in the DMG reads gzip-compressed archives only; for zstd or lz4 archives,
