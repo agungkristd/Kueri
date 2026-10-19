@@ -3,6 +3,24 @@
 Versions follow [Semantic Versioning](https://semver.org). Release builds are attached to the
 [GitHub releases](https://github.com/agungkristd/Kueri/releases) with their SHA-256 checksum.
 
+## 1.1.3
+
+- Delete rows from a table: one, or several picked with ⌘- or ⇧-click (Delete key or context menu),
+  after a confirmation.
+- Foreign-key cells show an arrow that opens the referenced table filtered to that value.
+- Click a column header to sort ascending, again for descending; the query is rewritten to match.
+- Results of a hand-written single-table `SELECT *` can be edited like a browsed table.
+- Choose the grid and editor font (any monospaced family) in Settings, with a live preview.
+- Settings is a native preferences window: switching panes no longer redraws or shifts the toolbar.
+- ⌘T opens a tab directly; tabs are named after their connection.
+- Connections can be reordered by dragging; New Connection sits at the bottom of the list.
+- The database switcher (⌘K) opens without delay on servers with many databases.
+- The workspace no longer repeats the connection name next to the connection bar; rename from the
+  connection list (⇧⌘R).
+- A zoomed-out diagram stays centred in the view.
+- One sidebar toggle in the workspace toolbar instead of two.
+- Faster diagram drawing and lower memory use for large results.
+
 ## 1.1.2
 
 - Open source under the MIT License; the DMG now includes the license texts of the libraries it
