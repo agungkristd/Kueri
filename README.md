@@ -6,7 +6,7 @@
 
 <p align="center">
   A small, native macOS client for PostgreSQL, MySQL/MariaDB, SQLite and Redis.<br>
-  Swift, AppKit and SwiftUI. No Electron, no bundled runtime: the whole app is a few megabytes.
+  Swift, AppKit and SwiftUI. No Electron, no bundled runtime.
 </p>
 
 <p align="center">
