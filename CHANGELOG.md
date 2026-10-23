@@ -3,7 +3,7 @@
 Versions follow [Semantic Versioning](https://semver.org). Release builds are attached to the
 [GitHub releases](https://github.com/agungkristd/Kueri/releases) with their SHA-256 checksum.
 
-## Unreleased
+## 1.1.4
 
 - Details panel: enum and boolean fields are pickers; every field has a menu (copy, expand, set
   NULL or empty string, revert; Pretty and Minify for JSON); JSON values show formatted in an

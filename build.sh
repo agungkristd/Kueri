@@ -19,8 +19,8 @@ cat > $APP/Contents/Info.plist <<PL
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundleName</key><string>Kueri</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.3</string>
-<key>CFBundleVersion</key><string>5</string>
+<key>CFBundleShortVersionString</key><string>1.1.4</string>
+<key>CFBundleVersion</key><string>6</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>Kueri connects to database servers on your local network.</string>
