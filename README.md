@@ -6,7 +6,7 @@
 
 <p align="center">
   A small, native macOS client for PostgreSQL, MySQL/MariaDB, SQLite and Redis.<br>
-  Swift, AppKit and SwiftUI. No Electron, no bundled runtime: a 5 MB download that idles at 60–85 MB of memory.
+  Swift, AppKit and SwiftUI. No Electron, no bundled runtime: the whole app is a few megabytes.
 </p>
 
 <p align="center">
@@ -31,10 +31,15 @@
 - Click a column header to sort; the query is rewritten to `ORDER BY` that column, ascending then
   descending.
 - Foreign-key cells have an arrow that opens the referenced table, filtered to that row.
-- A row details panel with JSON formatting and search.
+- A row details panel: every field of the selected row, with search. Enum and boolean columns are
+  pickers, JSON is shown formatted in an editor (Pretty / Minify), long values get a one-click
+  Show all, and each field has a menu to copy it, set it NULL or empty, or revert it.
+- ⌘Z and ⇧⌘Z undo and redo unsaved edits, whether made in the grid or in the details panel.
 - Tables, structure views and diagrams open side by side in tabs; every connection gets its own
   window tab (⌘T), and tabs reconnect after a restart. Drag connections to reorder them.
 - A connection bar shows server version, connection, database and table, in red for production.
+- When the server goes away (sleep, a Wi-Fi change, a restart) a banner offers Reconnect; tabs,
+  results and unsaved edits stay as they were.
 
 ### Write queries
 
@@ -56,6 +61,12 @@
 - Columns and indexes are edited in the grid like a spreadsheet: add a row, rename, pick the type,
   NULL, algorithm or index columns from a menu, delete. Nothing runs until you save, and the SQL is
   shown first. SQLite can only rename existing columns.
+
+### Manage databases
+
+- Create databases and schemas from the sidebar's **+** menu.
+- **Database Owner…** (PostgreSQL) hands the open database to another role together with every
+  schema, table, view, sequence, function and type in it, in one transaction.
 
 ### Move data
 
@@ -172,3 +183,8 @@ PostgreSQL client tools, OpenSSL and MIT Kerberos under their own permissive lic
 - SQLite columns can be renamed, added and deleted, but not retyped (SQLite needs the table rebuilt).
 - Server processes are listed over the tab's own connection, so the list waits while that tab is
   running a long query (use Stop for the tab's own query).
+- A connection that silently died is detected within about 25 seconds on PostgreSQL (TCP
+  keepalives); on MySQL and Redis the next query reports it.
+- Database Owner… works on the database you are connected to and leaves objects that belong to an
+  extension with the extension.
+- Undo covers unsaved edits only; saving, discarding or switching tabs clears the undo history.
