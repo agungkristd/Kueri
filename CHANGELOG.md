@@ -3,6 +3,10 @@
 Versions follow [Semantic Versioning](https://semver.org). Release builds are attached to the
 [GitHub releases](https://github.com/agungkristd/Kueri/releases) with their SHA-256 checksum.
 
+## Unreleased
+
+- Fixed: a details field that fit exactly in its collapsed height still offered Show all.
+
 ## 1.1.4
 
 - Details panel: enum and boolean fields are pickers; every field has a menu (copy, expand, set

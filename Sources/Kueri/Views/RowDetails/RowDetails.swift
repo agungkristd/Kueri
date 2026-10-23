@@ -13,7 +13,7 @@ struct RowDetails: View {
     @State private var expanded: Set<Int> = []
     @State private var clippedJSON: Set<Int> = [] // JSON fields whose 8-line view hides wrapped lines (reported by the view)
     @State private var copied: Int?               // field whose value was just copied (brief checkmark)
-    @State private var panelWidth: CGFloat = 0    // width of the fields column, for wrapped-line counts
+    @State private var fieldWidths: [Int: CGFloat] = [:] // each field's text width, for wrapped-line counts
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,9 +34,6 @@ struct RowDetails: View {
                     }
                     .padding(.horizontal, 14)
                     .padding(.bottom, 14)
-                    .background(GeometryReader { g in
-                        Color.clear.onAppear { panelWidth = g.size.width }.onChange(of: g.size.width) { panelWidth = $1 }
-                    })
                 }
             } else {
                 ContentUnavailableView("No row selected", systemImage: "sidebar.right",
@@ -72,8 +69,7 @@ struct RowDetails: View {
         let open = expanded.contains(i) || (!search.isEmpty && text.localizedCaseInsensitiveContains(search))
         let multiline = text.contains("\n") || text.count > 40
         let options = editable && !jsonView ? choices(i) : nil
-        // Text inside the box: panel minus its padding (14), the box padding (8) and the menu (18).
-        let clipped = Self.clipped(text, jsonView: jsonView, editable: editable, width: panelWidth - 2 * 14 - 2 * 8 - 18)
+        let clipped = Self.clipped(text, jsonView: jsonView, editable: editable, width: fieldWidths[i] ?? 0)
         VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(marked(AttributedString(result.columns[i]))).font(.callout)
@@ -131,6 +127,12 @@ struct RowDetails: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
+                // The text's real width (an estimate from the panel width was a few points off and
+                // counted a line that wasn't there).
+                .background(GeometryReader { g in
+                    Color.clear.onAppear { fieldWidths[i] = g.size.width }
+                        .onChange(of: g.size.width) { if fieldWidths[i] != $1 { fieldWidths[i] = $1 } }
+                })
                 .padding(.trailing, 18) // room for the menu
                 .overlay(alignment: .topTrailing) {
                     fieldMenu(i, value: current, reformat: jsonView, isNull: isNull, editable: editable, jsonView: jsonView, multiline: multiline, open: open, changed: changed)
@@ -260,7 +262,7 @@ extension RowDetails {
         // One line measured the same way: the layout's line height is rounded, the font metrics aren't.
         let line = ("x" as NSString).boundingRect(with: CGSize(width: width, height: .greatestFiniteMagnitude),
                                                   options: [.usesLineFragmentOrigin], attributes: [.font: font]).height
-        return h > CGFloat(cap) * line + 0.5
+        return h > (CGFloat(cap) + 0.5) * line // half a line of slack: layout engines round differently
     }
 
     func pick(_ i: Int, _ new: String?, stored: String?) {
