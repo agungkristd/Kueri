@@ -164,7 +164,7 @@ struct SQLEditor: NSViewRepresentable {
         tv.isContinuousSpellCheckingEnabled = false
         tv.textContainerInset = NSSize(width: 6, height: 8)
         tv.drawsBackground = true
-        tv.backgroundColor = .textBackgroundColor
+        tv.backgroundColor = .windowBackgroundColor // the content column's colour; the side panels are the dark ones
         tv.delegate = context.coordinator
         tv.string = text
         SQLHighlighter.apply(to: tv)

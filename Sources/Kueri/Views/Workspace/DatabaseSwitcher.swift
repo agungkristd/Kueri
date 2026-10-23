@@ -7,6 +7,7 @@ import SwiftUI
 struct DatabaseSwitcher: View {
     @Bindable var session: Session
     var newDatabase: () -> Void = {}
+    var changeOwner: () -> Void = {}
     @State private var buttonHeight: CGFloat = 28
     var body: some View {
         Button { session.dbPicker.toggle() } label: {
@@ -27,7 +28,7 @@ struct DatabaseSwitcher: View {
         // A dropdown hanging from the button, exactly as wide as it (not a popover).
         .overlay(alignment: .top) {
             if session.dbPicker { // read here only: a binding from WorkspaceView re-ran its whole body
-                DatabaseDropdown(session: session, newDatabase: newDatabase) { session.dbPicker = false }
+                DatabaseDropdown(session: session, newDatabase: newDatabase, changeOwner: changeOwner) { session.dbPicker = false }
                     .offset(y: buttonHeight + 4)
             }
         }
@@ -37,6 +38,7 @@ struct DatabaseSwitcher: View {
 struct DatabaseDropdown: View {
     @Bindable var session: Session
     let newDatabase: () -> Void
+    var changeOwner: () -> Void = {}
     let close: () -> Void
     @State private var search = ""
     @State private var highlighted: String?
@@ -73,6 +75,12 @@ struct DatabaseDropdown: View {
                 Label("New Database…", systemImage: "plus").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
             }
             .buttonStyle(.plain).padding(.horizontal, 10).padding(.vertical, 7)
+            if session.conn.kind == .postgres {
+                Button { close(); changeOwner() } label: {
+                    Label("Database Owner…", systemImage: "person.badge.key").frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain).padding(.horizontal, 10).padding(.bottom, 7)
+            }
         }
         .fixedSize(horizontal: false, vertical: true)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .windowBackgroundColor)))

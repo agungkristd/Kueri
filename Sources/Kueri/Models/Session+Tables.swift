@@ -3,13 +3,14 @@ import SwiftUI
 extension Session {
     private func snapshot() -> WorkTab {
         WorkTab(id: activeTab, kind: kind, sql: sql, result: result, selectedRow: selectedRow, edits: edits, table: table,
-                primaryKey: primaryKey, browsed: browsed, offset: offset, error: error, diagram: diagram)
+                primaryKey: primaryKey, enumValues: enumValues, browsed: browsed, offset: offset, error: error, diagram: diagram)
     }
 
     private func load(_ t: WorkTab) {
         activeTab = t.id; kind = t.kind; sql = t.sql; result = t.result; selectedRow = t.selectedRow; edits = t.edits
-        table = t.table; primaryKey = t.primaryKey; browsed = t.browsed; offset = t.offset; error = t.error; diagram = t.diagram
+        table = t.table; primaryKey = t.primaryKey; enumValues = t.enumValues; browsed = t.browsed; offset = t.offset; error = t.error; diagram = t.diagram
         selectedRows = []
+        undoManager?.removeAllActions(withTarget: self) // undo entries refer to the rows of one tab
     }
 
     /// Applies an async result to the tab that requested it, whether or not it is still active.
@@ -295,6 +296,67 @@ extension Session {
     func openTemplate(_ o: NewObject) {
         newTab()
         sql = template(o)
+    }
+
+    // MARK: Database owner (Postgres; MySQL has no owner concept — Limitation)
+
+    nonisolated static func alterOwnerSQL(database: String, owner: String) -> String {
+        "ALTER DATABASE \(quoteIdent(database)) OWNER TO \(quoteIdent(owner))"
+    }
+
+    /// One ALTER … OWNER TO per object of the current database not yet owned by `owner`: schemas,
+    /// relations (tables, views, sequences, …), routines and types. Objects that belong to an
+    /// extension stay with it. ALTER DATABASE alone would leave every table with the old owner.
+    nonisolated static func transferOwnershipListSQL(owner: String) -> String {
+        let role = "'" + owner.replacingOccurrences(of: "'", with: "''") + "'"
+        let system = "n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%'"
+        let notExt = { (oid: String) in "NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = \(oid) AND d.deptype = 'e')" }
+        return """
+        SELECT 'ALTER SCHEMA ' || quote_ident(n.nspname) || ' OWNER TO ' || quote_ident(\(role)) FROM pg_namespace n
+          WHERE \(system) AND pg_get_userbyid(n.nspowner) <> \(role) AND \(notExt("n.oid"))
+        UNION ALL
+        SELECT 'ALTER ' || CASE c.relkind WHEN 'c' THEN 'TYPE ' || c.oid::regtype::text ELSE 'TABLE ' || c.oid::regclass::text END
+               || ' OWNER TO ' || quote_ident(\(role))
+          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f', 'c') AND \(system) AND pg_get_userbyid(c.relowner) <> \(role) AND \(notExt("c.oid"))
+        UNION ALL
+        SELECT 'ALTER ROUTINE ' || p.oid::regprocedure::text || ' OWNER TO ' || quote_ident(\(role))
+          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+          WHERE \(system) AND pg_get_userbyid(p.proowner) <> \(role) AND \(notExt("p.oid"))
+        UNION ALL
+        SELECT 'ALTER TYPE ' || t.oid::regtype::text || ' OWNER TO ' || quote_ident(\(role))
+          FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+          WHERE t.typtype IN ('d', 'e', 'r') AND \(system) AND pg_get_userbyid(t.typowner) <> \(role) AND \(notExt("t.oid"))
+        """
+    }
+
+    /// Roles that can own a database (system pg_* roles left out) and the owner of the current database.
+    func databaseOwners() async throws -> (roles: [String], owner: String?) {
+        try await onQueue { db in
+            let r = try db.query("SELECT rolname FROM pg_roles WHERE rolname NOT LIKE 'pg\\_%' ORDER BY 1")
+            let o = try db.query("SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = current_database()")
+            return ((0..<r.rows.count).compactMap { r.rows.cell($0, 0) }, o.rows.count > 0 ? o.rows.cell(0, 0) : nil)
+        }
+    }
+
+    /// Makes `owner` own the current database and everything in it, in one transaction (all or
+    /// nothing). Returns how many objects inside changed hands. Needs to run as a superuser or a
+    /// member of both roles, which the server checks.
+    func transferDatabase(to owner: String) async throws -> Int {
+        let database = conn.database
+        let n = try await onQueue { db -> Int in
+            let list = try db.query(Self.transferOwnershipListSQL(owner: owner))
+            let statements = (0..<list.rows.count).compactMap { list.rows.cell($0, 0) }
+            _ = try db.query("BEGIN")
+            do {
+                for sql in statements { _ = try db.query(sql) }
+                _ = try db.query(Self.alterOwnerSQL(database: database, owner: owner))
+                _ = try db.query("COMMIT")
+            } catch { _ = try? db.query("ROLLBACK"); throw error }
+            return statements.count
+        }
+        tables = try await onQueue { try $0.tables() }
+        return n
     }
 
     func createDatabaseSQL(_ name: String) -> String {

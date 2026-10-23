@@ -2,9 +2,8 @@ import SwiftUI
 
 /// Syntax colours for the editor, applied as layout-manager temporary attributes: the text, its
 /// undo history and what gets run are untouched. Same palette as the history list.
-/// Muted on purpose: identifiers (most of a query) keep the normal text colour, and the few
-/// coloured kinds are desaturated so nothing glares on a dark background; light mode uses darker
-/// tones of the same hues for contrast.
+/// Saturated enough to tell the kinds apart at a glance (the Xcode hues, which Mac developers
+/// already read fluently); identifiers keep the normal text colour, so most of a query stays calm.
 enum SQLHighlighter {
     private static func tone(light: UInt32, dark: UInt32) -> NSColor {
         func c(_ v: UInt32) -> NSColor {
@@ -12,11 +11,11 @@ enum SQLHighlighter {
         }
         return NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? c(dark) : c(light) }
     }
-    static let keyword = tone(light: 0x2F5D93, dark: 0x82A9D9)    // soft blue
-    static let string = tone(light: 0x8A6418, dark: 0xC9A86B)     // turmeric, from the app's palette
-    static let number = tone(light: 0x6E4AA0, dark: 0xB49ED6)     // faded violet
-    static let type = tone(light: 0x2B7364, dark: 0x79B4A6)       // faded teal
-    static let comment = tone(light: 0x7A808A, dark: 0x7F8790)
+    static let keyword = tone(light: 0x9B2393, dark: 0xFF7AB2)    // magenta
+    static let string = tone(light: 0xC41A16, dark: 0xFF8170)     // red
+    static let number = tone(light: 0x1C00CF, dark: 0xD9C97C)     // blue / yellow
+    static let type = tone(light: 0x0B4F79, dark: 0x5DD8FF)       // teal / cyan
+    static let comment = tone(light: 0x5D6C79, dark: 0x7F8C98)
     static let identifier = NSColor.textColor                     // quoted names read as plain text
     // Limitation: re-colours the whole text on each change; fine for editor-sized SQL, skipped above 200 KB
     static let maxLength = 200_000

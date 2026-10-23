@@ -136,7 +136,20 @@ struct SidebarList: NSViewRepresentable {
 
         func outlineViewSelectionDidChange(_ n: Notification) {
             guard !reselecting, let ov = n.object as? NSOutlineView else { return }
-            let item = ov.item(atRow: ov.selectedRow)
+            selectionChanged = true
+            DispatchQueue.main.async { self.selectionChanged = false } // clicked(_:) runs before this
+            select(ov.item(atRow: ov.selectedRow))
+        }
+
+        /// A click on the row that is already selected changes no selection, so nothing above fires;
+        /// after a lost connection that left the table unloaded, it must still open the table.
+        var selectionChanged = false
+        @objc func clicked(_ ov: NSOutlineView) {
+            guard !selectionChanged, ov.clickedRow >= 0, ov.clickedRow == ov.selectedRow else { return }
+            select(ov.item(atRow: ov.clickedRow))
+        }
+
+        private func select(_ item: Any?) {
             let name = (item as? TableNode)?.name ?? (item as? ColumnNode)?.table.name
             guard let name else { return }
             DispatchQueue.main.async { [onSelect] in onSelect(name) } // outside AppKit's event handling
@@ -201,6 +214,8 @@ struct SidebarList: NSViewRepresentable {
         ov.columnAutoresizingStyle = .uniformColumnAutoresizingStyle // the one column always fills the sidebar
         ov.dataSource = context.coordinator
         ov.delegate = context.coordinator
+        ov.target = context.coordinator
+        ov.action = #selector(Coordinator.clicked(_:))
         let menu = NSMenu()
         menu.delegate = context.coordinator
         ov.menu = menu
@@ -263,32 +278,40 @@ struct SidebarFooter: View {
     @Bindable var session: Session
     let newSchema: () -> Void
     let newDatabase: () -> Void
+    var changeOwner: () -> Void = {}
     var transfer: (TransferSheet.Mode) -> Void = { _ in }
     var body: some View {
+        // Plain buttons whose menus are built on click (see popUpMenu): a SwiftUI Menu or Picker here
+        // kept the sidebar column re-laying out without end after a wake, until AppKit aborted.
         HStack(spacing: 8) {
-            Menu {
-                ForEach(session.availableNewObjects(), id: \.self) { o in
-                    Button(o.title) { session.openTemplate(o) }
-                }
+            Button {
+                var items = session.availableNewObjects().map { o in MenuEntry.item(o.title) { session.openTemplate(o) } }
                 if session.conn.kind == .postgres || session.conn.kind == .mysql {
-                    Divider()
-                    if session.conn.kind == .postgres { Button("New Schema…", action: newSchema) }
-                    Button("New Database…", action: newDatabase)
+                    items.append(.separator)
+                    if session.conn.kind == .postgres { items.append(.item("New Schema…", newSchema)) }
+                    items.append(.item("New Database…", newDatabase))
+                    if session.conn.kind == .postgres { items.append(.item("Database Owner…", changeOwner)) }
                 }
                 if session.canTransfer {
-                    Divider()
-                    Button("Export Database…") { transfer(.export) }
-                    Button("Import Database…") { transfer(.import) }
+                    items += [.separator, .item("Export Database…") { transfer(.export) }, .item("Import Database…") { transfer(.import) }]
                 }
-            } label: { Image(systemName: "plus") }
-            .menuIndicator(.hidden)
-            .fixedSize()
+                popUpMenu(items)
+            } label: { Image(systemName: "plus").frame(width: 22, height: 20).contentShape(Rectangle()) }
+            .buttonStyle(.borderless)
             .help("New table, view, function, schema or database; export or import")
             if session.conn.kind == .postgres, !session.schemas.isEmpty {
-                Picker("Schema", selection: $session.schema) {
-                    ForEach(session.schemas, id: \.self) { Text($0).tag($0) }
+                MenuButton {
+                    session.schemas.map { s in MenuEntry.item(s, checked: s == session.schema) { session.schema = s } }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(session.schema).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.up.chevron.down").font(.caption).foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(.quaternary.opacity(0.6)))
+                    .contentShape(Rectangle())
                 }
-                .labelsHidden()
                 .help("Schema")
             } else {
                 Spacer()
@@ -337,6 +360,57 @@ struct NewSchemaSheet: View {
                 if what == .schema { try await session.createSchema(n) } else { try await session.createDatabase(n, open: openAfter) }
                 done()
             } catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
+/// Hands the open database to another role: the database itself and every schema, table, view,
+/// sequence, routine and type in it (ALTER DATABASE alone leaves the objects with the old owner).
+/// Only the connected database: the objects inside can't be reached from another one.
+struct DatabaseOwnerSheet: View {
+    let session: Session
+    let done: () -> Void
+    @State private var owner = ""
+    @State private var roles: [String] = []
+    @State private var current: String?
+    @State private var error: String?
+    @State private var running = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Database Owner").font(.headline)
+            Text("Database: \(session.conn.database)" + (current.map { " (owner: \($0))" } ?? ""))
+            if roles.isEmpty {
+                HStack { ProgressView().controlSize(.small); Text("Loading roles…").foregroundStyle(.secondary) }
+            } else {
+                Picker("New owner", selection: $owner) { ForEach(roles, id: \.self) { Text($0).tag($0) } }
+            }
+            Text("Also transfers every schema, table, view, sequence, function and type in it that the new owner "
+                 + "doesn't own yet, in one transaction. Objects of extensions are left alone.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text(Session.alterOwnerSQL(database: session.conn.database, owner: owner.isEmpty ? "role" : owner) + " + ALTER … OWNER TO per object")
+                .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            if let error { Text(error).foregroundStyle(.red).font(.callout).textSelection(.enabled) }
+            HStack {
+                Spacer()
+                Button("Cancel", action: done).keyboardShortcut(.cancelAction)
+                Button(running ? "Transferring…" : "Change Owner", action: run).keyboardShortcut(.defaultAction)
+                    .disabled(running || owner.isEmpty)
+            }
+        }
+        .padding(18).frame(width: 440)
+        .task {
+            do {
+                (roles, current) = try await session.databaseOwners()
+                owner = current ?? roles.first ?? ""
+            } catch { self.error = error.localizedDescription }
+        }
+    }
+    private func run() {
+        running = true; error = nil
+        Task {
+            defer { running = false }
+            do { _ = try await session.transferDatabase(to: owner); done() }
+            catch { self.error = error.localizedDescription }
         }
     }
 }

@@ -31,38 +31,46 @@ func prettyJSON(_ s: String) -> String? {
     return out
 }
 
-/// Colors formatted JSON (keys, strings, numbers, literals). Characters are never added or
-/// removed, only attributed. Very large values are returned plain to keep the panel light.
-func highlightJSON(_ s: String) -> AttributedString {
-    var out = AttributedString(s)
-    guard s.utf8.count <= 200_000 else { return out }
-    let chars = Array(s)
-    var idx = out.startIndex
-    var i = 0
-    func color(_ n: Int, _ c: Color) {
-        let end = out.index(idx, offsetByCharacters: n)
-        out[idx..<end].foregroundColor = c
-        idx = end; i += n
+/// The same JSON on one line: whitespace outside strings removed, key order kept.
+func minifyJSON(_ s: String) -> String? {
+    guard prettyJSON(s) != nil else { return nil }
+    var out = "", inString = false, escaped = false
+    for c in s {
+        if inString {
+            if escaped { escaped = false } else if c == "\\" { escaped = true } else if c == "\"" { inString = false }
+        } else if c == "\"" { inString = true } else if c.isWhitespace { continue }
+        out.append(c)
     }
-    while i < chars.count {
-        let c = chars[i]
-        if c == "\"" {
+    return out
+}
+
+enum JSONToken { case key, string, number, literal, punctuation }
+
+/// Token ranges (UTF-16, for NSString / text views) of keys, strings, numbers, literals and
+/// punctuation. Very large values return nothing, to keep the panel light.
+func jsonTokens(_ s: String) -> [(NSRange, JSONToken)] {
+    let u = Array(s.utf16)
+    guard u.count <= 200_000 else { return [] }
+    func ch(_ c: Character) -> UInt16 { c.utf16.first! }
+    let quote = ch("\""), backslash = ch("\\"), colon = ch(":"), space = ch(" ")
+    var out: [(NSRange, JSONToken)] = [], i = 0
+    while i < u.count {
+        let c = u[i]
+        if c == quote {
             var j = i + 1, esc = false
-            while j < chars.count { if esc { esc = false } else if chars[j] == "\\" { esc = true } else if chars[j] == "\"" { break }; j += 1 }
-            let len = min(j + 1, chars.count) - i
-            var k = i + len
-            while k < chars.count, chars[k] == " " { k += 1 }
-            color(len, k < chars.count && chars[k] == ":" ? .teal : .green) // key vs string value
-        } else if c == "-" || c.isNumber {
-            var j = i; while j < chars.count, "-+.eE0123456789".contains(chars[j]) { j += 1 }
-            color(j - i, .orange)
-        } else if let lit = ["true", "false", "null"].first(where: { String(chars[i..<min(i + $0.count, chars.count)]) == $0 }) {
-            color(lit.count, .pink)
-        } else if "{}[],:".contains(c) {
-            color(1, .secondary)
-        } else {
-            idx = out.index(afterCharacter: idx); i += 1
-        }
+            while j < u.count { if esc { esc = false } else if u[j] == backslash { esc = true } else if u[j] == quote { break }; j += 1 }
+            let end = min(j + 1, u.count)
+            var k = end; while k < u.count, u[k] == space { k += 1 }
+            out.append((NSRange(location: i, length: end - i), k < u.count && u[k] == colon ? .key : .string))
+            i = end
+        } else if c == ch("-") || (ch("0")...ch("9")).contains(c) {
+            var j = i; while j < u.count, "-+.eE0123456789".utf16.contains(u[j]) { j += 1 }
+            out.append((NSRange(location: i, length: j - i), .number)); i = j
+        } else if let lit = ["true", "false", "null"].first(where: { Array($0.utf16) == Array(u[i..<min(i + $0.count, u.count)]) }) {
+            out.append((NSRange(location: i, length: lit.count), .literal)); i += lit.count
+        } else if "{}[],:".utf16.contains(c) {
+            out.append((NSRange(location: i, length: 1), .punctuation)); i += 1
+        } else { i += 1 }
     }
     return out
 }

@@ -36,7 +36,21 @@ import SwiftUI
         // Real editing, not just the delegate answer: cell must be editable and an editor must open.
         tv.editColumn(1, row: 0, with: nil, select: true)
         check("cell editor opens", tv.editedRow == 0 && tv.currentEditor() != nil)
+        if let ed = tv.currentEditor() as? NSTextView {
+            ed.insertText("zz", replacementRange: ed.selectedRange())
+            ed.doCommand(by: #selector(NSResponder.cancelOperation(_:)))
+        }
+        check("Esc leaves the cell editor without a change", tv.editedRow == -1 && got == nil)
         tv.abortEditing()
+        // Into a cell and out again (click elsewhere / Return) without typing: no edit.
+        for c in [0, 1] {
+            let c2 = tv.delegate as? ResultGrid.Coordinator
+            c2?.markStarted(0, in: tv) // as a double-click does
+            tv.editColumn(c, row: 0, with: nil, select: true)
+            win.makeFirstResponder(tv)
+            check("leaving an untouched cell (column \(c)) records no edit and drops the tint", got == nil && c2?.inEditState(0) == false)
+            got = nil
+        }
         check("double-click wired to editing", tv.doubleAction != nil && tv.target is ResultGrid.Coordinator)
         ds.tableView?(tv, setObjectValue: "a", for: col, row: 0)
         check("unchanged commit ignored", got == nil)
@@ -44,10 +58,49 @@ import SwiftUI
         check("unchanged NULL commit ignored", got == nil)
         ds.tableView?(tv, setObjectValue: "b", for: col, row: 0)
         check("edit reported", got?.0 == 0 && got?.1 == 1 && got?.2 == "b")
+        // Editor opened on "a", then Details set the cell NULL; closing the untouched editor must not bring "a" back.
+        got = nil
+        if let c2 = tv.delegate as? ResultGrid.Coordinator {
+            _ = c2.tableView(tv, shouldEdit: col, row: 0)
+            c2.edits = [0: [1: nil]]
+            ds.tableView?(tv, setObjectValue: "a", for: col, row: 0)
+            check("stale editor text doesn't overwrite a NULL set in Details", got == nil)
+            ds.tableView?(tv, setObjectValue: "typed", for: col, row: 0)
+            check("typed text in that editor still counts", got?.2 == "typed")
+            c2.edits = [:]; c2.openedWith = nil; got = nil
+        }
+        // ⌘Z: Edit › Undo drives the window's undo manager, so the hosted view must be handed that same one.
+        final class Seen { var um: UndoManager? }
+        struct Probe: View { let seen: Seen; @Environment(\.undoManager) var um; var body: some View { Color.clear.onAppear { seen.um = um } } }
+        let seen = Seen(), uw = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 200, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
+        uw.contentView = NSHostingView(rootView: Probe(seen: seen)); uw.orderFrontRegardless(); RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        check("hosted view sees the window's undo manager", seen.um != nil && seen.um === uw.undoManager)
+        check("ownership list SQL embeds the role as a literal",
+              Session.transferOwnershipListSQL(owner: "o'r").contains("quote_ident('o''r')") && !Session.transferOwnershipListSQL(owner: "x").contains("'x\""))
+        check("owner SQL quotes both identifiers",
+              Session.alterOwnerSQL(database: "my\"db", owner: "sai_app") == "ALTER DATABASE \"my\"\"db\" OWNER TO \"sai_app\"")
+        // A query stuck on a dead connection holds `busy`; Reconnect must release it or every click is dropped.
+        let rs = Session.preview(Conn(name: "mem", kind: .sqlite, path: ":memory:"))
+        rs.busy = true; rs.error = "server closed the connection unexpectedly"
+        rs.reconnect()
+        for _ in 0..<40 where rs.reconnecting || rs.busy { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
+        check("Reconnect clears busy and the error", !rs.busy && rs.error == nil && !rs.connectionLost)
+        let us = Session.preview(Conn(name: "mem", kind: .sqlite, path: ":memory:"))
+        us.result = small; us.undoManager = uw.undoManager
+        // Edits in one event share an undo group (as typing does); separate events undo one by one.
+        us.setEdit(row: 0, column: 1, value: .some("b")); RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        us.setEdit(row: 0, column: 1, value: .some("c")); RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        uw.undoManager?.undo(); check("⌘Z takes back the last edit", us.edits[0]?[1] == "b")
+        uw.undoManager?.undo(); check("⌘Z again leaves no edits", us.edits.isEmpty)
+        uw.undoManager?.redo(); check("⌘⇧Z redoes it", us.edits[0]?[1] == "b")
+        us.discardEdits(); check("Discard clears the undo history too", us.edits.isEmpty && uw.undoManager?.canUndo == false)
+        uw.close()
         editHost.rootView = ResultGrid(result: small, edits: [0: [1: "b"]], editable: true)
         editHost.layoutSubtreeIfNeeded()
         let shown = ds.tableView?(tv, objectValueFor: col, row: 0) as? NSAttributedString
         check("edited cell shows pending value", shown?.string == "b")
+        check("an edited row stays tinted", (tv.delegate as? ResultGrid.Coordinator)?.inEditState(0) == true
+              && (tv.delegate as? ResultGrid.Coordinator)?.inEditState(1) == false)
     } else { check("grid found", false) }
 
     // Several rows: ⌘/⇧-click selection is reported, and Delete deletes all of it (filtered rows map back).
@@ -174,6 +227,84 @@ import SwiftUI
             check("zoomed-out diagram: table drags to the view's edge", emptyBefore && canvas.menu(for: event(.rightMouseDown, edge)) != nil)
         } else { check("diagram canvas found", false) }
         dw.close()
+    }
+    // Details: enum columns and booleans get a picker, other columns a text field.
+    let picks = RowDetails(result: QueryResult(columns: ["kind", "active", "name"], types: ["kind_t", "bool", "text"], rows: [["a", "t", "x"]]),
+                           row: 0, edits: .constant([:]), enumValues: ["kind": ["a", "b"]])
+    check("Details offers enum and boolean values", picks.choices(0) == ["a", "b"] && picks.choices(1) == ["t", "f"]
+          && picks.choices(2) == nil && picks.choiceLabel("t", 1) == "TRUE")
+    // No pop-up button per field: SwiftUI kept re-updating those without end (full-CPU freeze).
+    do {
+        let pw = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 400), styleMask: [.titled], backing: .buffered, defer: false)
+        let ph = NSHostingView(rootView: RowDetails(result: QueryResult(columns: ["kind", "active", "doc"], types: ["kind_t", "bool", "jsonb"], rows: [["a", "t", #"{"x": [1, 2]}"#]]),
+                                                    row: 0, edits: .constant([:]), enumValues: ["kind": ["a", "b"]]).frame(width: 320, height: 400))
+        pw.contentView = ph; pw.orderFrontRegardless(); RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        func popups(_ v: NSView) -> Int { (v is NSPopUpButton ? 1 : 0) + v.subviews.reduce(0) { $0 + popups($1) } }
+        check("Details fields keep no pop-up buttons", popups(ph) == 0)
+        // Same for the sidebar footer: its schema Picker and "+" Menu looped the sidebar after a wake.
+        let fs = Session.preview(Conn(name: "pg", kind: .postgres)); fs.schemas = ["public", "audit"]; fs.schema = "audit"
+        let fh = NSHostingView(rootView: SidebarFooter(session: fs, newSchema: {}, newDatabase: {}).frame(width: 260))
+        pw.contentView = fh; RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check("sidebar footer keeps no pop-up buttons", popups(fh) == 0)
+        // JSON values are measured off-screen (sizing the shown text view from sizeThatFits looped
+        // SwiftUI layout at full CPU); the measure must still follow the width and the line cap.
+        let long = "{" + (1...80).map { #""key\#($0)": "value \#($0) with some words to wrap""# }.joined(separator: ", ") + "}"
+        let jc = NSHostingController(rootView: JSONTextView(text: long)), capped = NSHostingController(rootView: JSONTextView(text: long, maxLines: 8))
+        let narrow = jc.sizeThatFits(in: NSSize(width: 120, height: 1e6)).height, wide = jc.sizeThatFits(in: NSSize(width: 900, height: 1e6)).height
+        let cap = capped.sizeThatFits(in: NSSize(width: 120, height: 1e6)).height
+        check("JSON height follows the width and the line cap", narrow > wide && wide > cap && cap > 0)
+        // A long value gets a one-click "Show all" under it (Expand in the menu alone was two clicks).
+        // SwiftUI buttons expose no accessibility tree to the bench, so the condition is what's checked.
+        let pretty = prettyJSON(long) ?? long
+        check("long JSON value counts as clipped", RowDetails.clipped(pretty, jsonView: true, editable: false))
+        // One logical line that wraps past 3 lines in a narrow field (the user's `question` column).
+        let q = "Gerak lurus beraturan (GLB) adalah gerak benda pada lintasan lurus dengan ..."
+        check("wrapped text field counts as clipped at panel width", RowDetails.clipped(q, jsonView: false, editable: true, width: 170)
+              && !RowDetails.clipped(q, jsonView: false, editable: true, width: 900))
+        // Few logical lines but wrapped past the cap in a narrow panel (the user's case): the view reports it.
+        var reported: [Bool] = []
+        let wrapped = "{\n  \"value\": \"" + String(repeating: "lurus beraturan ", count: 20) + "\"\n}"
+        let wc = NSHostingController(rootView: JSONTextView(text: wrapped, maxLines: 8, onClipped: { reported.append($0) }))
+        _ = wc.sizeThatFits(in: NSSize(width: 120, height: 1e6)); RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        check("wrapped JSON beyond the cap reports clipped", reported == [true])
+        _ = wc.sizeThatFits(in: NSSize(width: 3000, height: 1e6)); RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        check("wide enough to fit reports not clipped", reported == [true, false])
+        // Hosted in a SwiftUI layout (the real Details path): SwiftUI may ask for the size before updateNSView.
+        var hosted: [Bool] = []
+        let hv = NSHostingView(rootView: VStack { JSONTextView(text: wrapped, maxLines: 8, onClipped: { hosted.append($0) }) }.frame(width: 230))
+        pw.contentView = hv; RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check("clipping is reported from a hosted SwiftUI layout", hosted == [true])
+        check("short values offer no Show all", !RowDetails.clipped("a\nb", jsonView: false, editable: false, width: 200) && !RowDetails.clipped("{\"x\": 1}", jsonView: true, editable: true, width: 200))
+        pw.close()
+    }
+    // Moving to another row must not carry a picker's value over as an edit.
+    do {
+        var pending: [Int: [Int: String?]] = [:]
+        let res = QueryResult(columns: ["type"], types: ["kind_t"], rows: [["MARKDOWN"], ["INTERACTIVE"], ["MARKDOWN"]])
+        func details(_ r: Int) -> some View {
+            RowDetails(result: res, row: r, edits: Binding(get: { pending[r] ?? [:] }, set: { pending[r] = $0.isEmpty ? nil : $0 }),
+                       enumValues: ["type": ["MARKDOWN", "INTERACTIVE"]]).frame(width: 300, height: 300)
+        }
+        let pw = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 300), styleMask: [.titled], backing: .buffered, defer: false)
+        let ph = NSHostingView(rootView: AnyView(details(0)))
+        pw.contentView = ph; pw.orderFrontRegardless()
+        for r in [1, 2, 1] { RunLoop.main.run(until: Date().addingTimeInterval(0.2)); ph.rootView = AnyView(details(r)) }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        check("changing rows leaves no edits behind", pending.isEmpty)
+        // Same with a text field focused (a click into a Details value, then another row in the grid).
+        let tres = QueryResult(columns: ["id", "name"], types: ["int4", "text"], rows: [["1", "ana"], ["2", "budi"], ["3", "cici"]])
+        func tdetails(_ r: Int) -> some View {
+            RowDetails(result: tres, row: r, edits: Binding(get: { pending[r] ?? [:] }, set: { pending[r] = $0.isEmpty ? nil : $0 })).frame(width: 300, height: 300)
+        }
+        ph.rootView = AnyView(tdetails(0)); RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        func fields(_ v: NSView) -> [NSTextField] { ((v as? NSTextField).map { $0.isEditable ? [$0] : [] } ?? []) + v.subviews.flatMap(fields) }
+        if let f = fields(ph).first(where: { $0.stringValue == "1" }) {
+            pw.makeKey(); pw.makeFirstResponder(f)
+            for r in [1, 2] { RunLoop.main.run(until: Date().addingTimeInterval(0.2)); ph.rootView = AnyView(tdetails(r)) }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3)); pw.makeFirstResponder(nil); RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+            check("changing rows with a field focused leaves no edits behind", pending.isEmpty)
+        } else { check("details id field found", false) }
+        pw.close()
     }
     check("four tabs open", ts.tabs.count == 4)
     ts.closeTab(ts.activeTab)

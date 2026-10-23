@@ -7,6 +7,15 @@ import SwiftUI
 /// Table that paints rows in an edit state with a light tint across the whole row (under the cells).
 final class GridTable: NSTableView {
     var isTinted: (Int) -> Bool = { _ in false }
+    /// Alternating rows on the window-background colour: the system pair is the darker text
+    /// background, which is now the side panels' colour.
+    override func drawBackground(inClipRect clip: NSRect) {
+        super.drawBackground(inClipRect: clip)
+        let rows = self.rows(in: clip)
+        guard rows.length > 0 else { return }
+        NSColor.labelColor.withAlphaComponent(0.035).setFill()
+        for r in stride(from: rows.location | 1, to: rows.location + rows.length, by: 2) { rect(ofRow: r).intersection(clip).fill() }
+    }
     override func keyDown(with e: NSEvent) {
         // Delete / forward delete: delete the selected rows (asks first).
         if [51, 117].contains(e.keyCode), let c = delegate as? ResultGrid.Coordinator, c.onDeleteRows != nil { return c.deleteSelected(self) }
@@ -108,7 +117,7 @@ struct ResultGrid: NSViewRepresentable {
         static let editTint = NSColor.systemOrange.withAlphaComponent(0.13)
 
         /// Rows in an edit state: tinted, and a single click edits their cells.
-        func inEditState(_ row: Int) -> Bool { editsOnSingleClick(row) || startedRows.contains(row) }
+        func inEditState(_ row: Int) -> Bool { edits[row] != nil || editsOnSingleClick(row) || startedRows.contains(row) }
 
         /// `row` is a displayed row; the started set keeps rows of `result`.
         func markStarted(_ row: Int, in tv: NSTableView) {
@@ -222,7 +231,16 @@ struct ResultGrid: NSViewRepresentable {
         }
 
         // Return edits the selected cell; double-click is handled explicitly below.
-        func tableView(_ tv: NSTableView, shouldEdit column: NSTableColumn?, row: Int) -> Bool { canEdit(column, row: src(row)) }
+        func tableView(_ tv: NSTableView, shouldEdit column: NSTableColumn?, row: Int) -> Bool {
+            guard canEdit(column, row: src(row)) else { return false }
+            openedWith = (tableView(tv, objectValueFor: column, row: row) as? NSAttributedString)?.string
+                ?? tableView(tv, objectValueFor: column, row: row) as? String
+            return true
+        }
+        /// What the cell editor showed when it opened. If the value changes elsewhere while it is
+        /// open (Set NULL in Details, then Save), AppKit commits the editor's untouched text as an
+        /// edit, which overwrote the NULL with the old text.
+        var openedWith: String?
 
         @objc func clicked(_ tv: NSTableView) {
             // The arrow of a foreign-key cell: open the row it points to.
@@ -273,8 +291,26 @@ struct ResultGrid: NSViewRepresentable {
             guard let column, let i = Int(column.identifier.rawValue), row < result.rows.count else { return }
             let text = (value as? NSAttributedString)?.string ?? value as? String ?? ""
             let current = edits[row]?[i] ?? result.rows.cell(row, i)
-            if text == (current ?? "NULL") { return } // committed without changes
+            if text == (current ?? "NULL") || text == openedWith { return } // committed without typing anything
             onEdit(row, i, text)
+        }
+
+        /// However editing ended (Return, Tab, a click elsewhere, Esc; AppKit sends no commit for an
+        /// unchanged cell), the started rows go back to normal; rows with real edits stay tinted.
+        func controlTextDidEndEditing(_ n: Notification) {
+            openedWith = nil
+            guard !startedRows.isEmpty, let tv = n.object as? NSTableView else { return }
+            startedRows = []
+            tv.needsDisplay = true
+        }
+
+        /// Esc in a cell editor: drop what was typed and leave editing.
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+            guard sel == #selector(NSResponder.cancelOperation(_:)), let tv = control as? NSTableView, tv.editedRow >= 0 else { return false }
+            tv.abortEditing()
+            tv.window?.makeFirstResponder(tv)
+            startedRows = []; tv.needsDisplay = true
+            return true
         }
     }
 
@@ -295,7 +331,10 @@ struct ResultGrid: NSViewRepresentable {
         tv.isTinted = { [weak c = context.coordinator] row in c.map { $0.inEditState($0.src(row)) } ?? false }
         tv.style = .plain
         tv.focusRingType = .none // selection highlight is enough; the ring framed the whole grid
-        tv.usesAlternatingRowBackgroundColors = true
+        // Content column colour (lighter than the side panels); odd rows get a faint overlay in
+        // didAdd, since the system alternating colours are the darker text background.
+        tv.backgroundColor = .windowBackgroundColor
+        tv.usesAlternatingRowBackgroundColors = false
         tv.gridStyleMask = .solidVerticalGridLineMask
         tv.columnAutoresizingStyle = .noColumnAutoresizing
         tv.allowsMultipleSelection = true
@@ -378,6 +417,7 @@ struct ResultGrid: NSViewRepresentable {
             c.result = QueryResult()
             tv.reloadData()
             tv.tableColumns.forEach(tv.removeTableColumn)
+            let charWidth = ("0" as NSString).size(withAttributes: [.font: c.font]).width
             for i in shownColumns {
                 let name = result.columns[i]
                 let col = NSTableColumn(identifier: .init(String(i)))
@@ -389,9 +429,13 @@ struct ResultGrid: NSViewRepresentable {
                 cell.lineBreakMode = .byTruncatingTail
                 cell.truncatesLastVisibleLine = true
                 col.dataCell = cell
-                // Width from header + first rows, ~7.3pt per monospaced char.
+                col.headerCell.alignment = .center
+                // Fits the wider of the header (its own font, room for the sort arrow) and the first rows
+                // (monospaced: longest value × one character's width).
                 let chars = (0..<min(50, result.rows.count)).map { result.rows.cell($0, i)?.count ?? 4 }.max() ?? 0
-                col.width = min(400, max(60, CGFloat(max(chars, name.count)) * 7.3 + 16)) + (menuForCell(0, i) != nil || links.contains(i) ? GridCell.indicatorWidth : 0)
+                let header = (name as NSString).size(withAttributes: [.font: col.headerCell.font ?? .systemFont(ofSize: 11)]).width + 22
+                let content = CGFloat(chars) * charWidth + 10 + (menuForCell(0, i) != nil || links.contains(i) ? GridCell.indicatorWidth : 0)
+                col.width = min(400, max(36, header, content))
                 tv.addTableColumn(col)
             }
         }

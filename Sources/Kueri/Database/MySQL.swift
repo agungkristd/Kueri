@@ -155,6 +155,25 @@ final class MySQLDB: Database {
             """)
     }
 
+    func enumValues(_ t: String) throws -> [String: [String]] {
+        let (schema, name) = schemaAndName(t)
+        let rows = try query("""
+            SELECT column_name, column_type FROM information_schema.columns
+            WHERE table_schema = \(schema) AND table_name = \(name) AND data_type = 'enum'
+            """).rows
+        var m: [String: [String]] = [:]
+        for r in rows { if let c = r[0], let type = r[1] { m[c] = Self.enumLabels(type) } }
+        return m
+    }
+
+    /// `enum('a','it''s')` → ["a", "it's"].
+    static func enumLabels(_ type: String) -> [String] {
+        let re = try! NSRegularExpression(pattern: "'((?:[^']|'')*)'")
+        return re.matches(in: type, range: NSRange(type.startIndex..., in: type)).compactMap {
+            Range($0.range(at: 1), in: type).map { type[$0].replacingOccurrences(of: "''", with: "'") }
+        }
+    }
+
     func indexes(_ t: String) throws -> QueryResult {
         let (schema, name) = schemaAndName(t)
         return try query("""

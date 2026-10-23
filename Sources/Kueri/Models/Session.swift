@@ -4,7 +4,7 @@ import os
 @MainActor @Observable final class Session {
     private(set) var conn: Conn
     private var db: Database
-    private let queue = DispatchQueue(label: "db")
+    private var queue = DispatchQueue(label: "db")
     var tables: [String] = []
     var databases: [String] = []
     var schemas: [String] = []
@@ -19,6 +19,7 @@ import os
     var saving = false
     var table: String?        // table behind `result`, when it came from browse()
     var primaryKey: [String] = []
+    var enumValues: [String: [String]] = [:] // of `table`, for the Details pickers
     var browsed: (query: String, table: String, offset: Int)?
     var offset = 0            // first row of the current page when `table` is set
     // Table tabs: the fields above always hold the active tab; other tabs are parked in `tabs`.
@@ -132,6 +133,40 @@ import os
     }
 
     var switchingTo: String?
+    var reconnecting = false
+    var connectionLost: Bool { error.map(Self.isConnectionLost) ?? false }
+
+    /// Errors meaning the connection itself is gone (server restart, network change, sleep), so a
+    /// Reconnect button can be offered next to them.
+    nonisolated static func isConnectionLost(_ message: String) -> Bool {
+        let m = message.lowercased()
+        return ["no connection to the server", "server closed the connection", "terminating connection",
+                "connection reset", "broken pipe", "lost connection", "server has gone away", "not connected",
+                "connection refused", "connection timed out", "could not receive data", "could not send data",
+                "socket closed", "end of file"].contains { m.contains($0) }
+    }
+
+    /// Opens a fresh connection (and SSH tunnel) to the same database; tabs, results and unsaved
+    /// edits stay as they are.
+    func reconnect() {
+        guard !reconnecting else { return }
+        reconnecting = true
+        let c = conn
+        Task {
+            defer { reconnecting = false }
+            do {
+                let (newDB, t, d, sc, newTunnel, version) = try await Self.connectRetryingLocal(c)
+                // A fresh queue: work still waiting on the dead connection must not delay the new one.
+                db = newDB; tunnel = newTunnel; serverVersion = version; queue = DispatchQueue(label: "db")
+                tables = t; databases = d; schemas = sc
+                if !sc.contains(schema) { schema = sc.contains("public") ? "public" : (sc.first ?? "public") }
+                columnCache = [:]; columnCacheLoading = []
+                // The query stuck on the dead connection owned `busy`; it will not report back (its
+                // queue is gone, see run), so the next click has to be able to run.
+                error = nil; busy = false
+            } catch { self.error = error.localizedDescription }
+        }
+    }
 
 
     /// Dialect-quoted table name, for generated DDL.
@@ -189,6 +224,7 @@ import os
         let tab = activeTab
         let started = Date()
         let needKeys = source != nil && foreignKeys == nil
+        let queue = queue
         queue.async { [db] in
             let r = Result { try db.query(q) }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
@@ -197,8 +233,12 @@ import os
             let t = try? db.tables()
             let sc = try? db.schemas() // a CREATE SCHEMA run from the editor shows up right away
             let pk = source.flatMap { try? db.primaryKey($0) } ?? []
+            let ev = source.flatMap { try? db.enumValues($0) } ?? [:]
             let fks = needKeys ? (try? db.foreignKeys()) ?? [] : nil
             DispatchQueue.main.async {
+                // Reconnect replaced the queue: this is the error of the dead connection, long after
+                // the new one took over; applying it would hide the fresh rows and re-show the error.
+                guard queue === self.queue else { return }
                 if let fks { self.foreignKeys = fks }
                 self.busy = false
                 if !fromBrowse { // user-run queries only; sidebar browsing would flood the history
@@ -212,7 +252,7 @@ import os
                     case .success(let v):
                         w.result = v; w.selectedRow = nil; w.error = nil
                         if tab == self.activeTab { self.selectedRows = [] }
-                        w.table = source; w.primaryKey = pk; w.offset = source == nil ? 0 : pageOffset
+                        w.table = source; w.primaryKey = pk; w.enumValues = ev; w.offset = source == nil ? 0 : pageOffset
                         // The query behind an editable result: paging and header sorting rewrite it.
                         w.browsed = source.map { (q, $0, pageOffset) }
                     case .failure(let e): w.error = e.localizedDescription
@@ -285,7 +325,27 @@ import os
     func setEdit(row: Int, column: Int, value: String??) {
         var r = edits[row] ?? [:]
         if let value, value != (row < result.rows.count ? result.rows.cell(row, column) : nil) { r[column] = value } else { r.removeValue(forKey: column) }
-        edits[row] = r.isEmpty ? nil : r
+        setRowEdits(row, r)
+    }
+
+    /// The window's undo manager (Edit › Undo, ⌘Z), set by the workspace view.
+    weak var undoManager: UndoManager?
+
+    /// Every change to pending edits goes through here, so ⌘Z takes it back (and ⌘⇧Z redoes it).
+    /// Limitation: the stack is per window and is cleared when the tab, result or edits change
+    /// wholesale (save, discard, new query), so an undo never lands on another tab's rows.
+    func setRowEdits(_ row: Int, _ new: [Int: String?]) {
+        let old = edits[row] ?? [:]
+        guard old != new else { return }
+        undoManager?.registerUndo(withTarget: self) { s in s.setRowEdits(row, old) }
+        undoManager?.setActionName("Edit Cell")
+        edits[row] = new.isEmpty ? nil : new
+    }
+
+    /// Drops pending edits and the undo history that produced them.
+    func discardEdits() {
+        edits = [:]
+        undoManager?.removeAllActions(withTarget: self)
     }
 
     /// Saves every edited row (one UPDATE per row). Rows that fail keep their edits.
@@ -305,6 +365,7 @@ import os
                 do { try await save(row: row, changes: changes); edits[row] = nil }
                 catch { self.error = "Row \(offset + row + 1): \(error.localizedDescription)"; return }
             }
+            undoManager?.removeAllActions(withTarget: self) // saved rows can't be un-edited
         }
     }
 
@@ -372,9 +433,11 @@ import os
     }
 
     func browse(_ table: String, offset: Int = 0) {
+        let queue = queue
         queue.async { [db] in
             let q = Result { try db.browseQuery(table, offset: offset) }
             DispatchQueue.main.async {
+                guard queue === self.queue else { return } // see run()
                 switch q {
                 case .success(let v): self.browsed = (v, table, offset); self.sql = v; self.run()
                 case .failure(let e): self.error = e.localizedDescription

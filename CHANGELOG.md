@@ -3,6 +3,22 @@
 Versions follow [Semantic Versioning](https://semver.org). Release builds are attached to the
 [GitHub releases](https://github.com/agungkristd/Kueri/releases) with their SHA-256 checksum.
 
+## Unreleased
+
+- Details panel: enum and boolean fields are pickers; every field has a menu (copy, expand, set
+  NULL or empty string, revert; Pretty and Minify for JSON); JSON values show formatted in an
+  editor. Values cut off by the panel get a one-click Show all / Show less.
+- ⌘Z and ⇧⌘Z undo and redo unsaved cell edits, from the grid or the Details panel.
+- A lost connection (sleep, Wi-Fi change, server restart) is detected within about 25 seconds on
+  Postgres and shows a Reconnect banner; reconnecting keeps tabs, results and unsaved edits.
+  Clicking the selected table again reloads it.
+- Database Owner… (Postgres): hand the open database and everything in it — schemas, tables,
+  views, sequences, functions, types — to another role, in one transaction.
+- Sidebar and Details panel use solid dark backgrounds that don't change when the window loses
+  focus; the content column is the lighter one.
+- Fixed: expanding a large JSON value froze the app; a cell editor left open overwrote a NULL set
+  in Details with the old text on save; Esc leaves a cell editor without a change.
+
 ## 1.1.3
 
 - Delete rows from a table: one, or several picked with ⌘- or ⇧-click (Delete key or context menu),

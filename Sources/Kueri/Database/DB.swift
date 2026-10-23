@@ -145,6 +145,8 @@ protocol Database: AnyObject {
     func delete(_ table: String, key: [(String, String?)]) throws -> Int
     /// Browse query for the rows whose `column` equals `value` (following a foreign key).
     func filterQuery(_ table: String, column: String, value: String) -> String
+    /// Allowed values of a table's enum columns, by column name, in their declared order.
+    func enumValues(_ table: String) throws -> [String: [String]]
 }
 
 extension Database {
@@ -175,6 +177,7 @@ extension Database {
         "SELECT * FROM \(quoteTable(table)) WHERE \(quoteIdent(column)) = '\(value.replacingOccurrences(of: "'", with: "''"))' LIMIT \(pageSize)"
     }
     func firstColumn(_ sql: String) throws -> [String] { try query(sql).rows.compactMap { $0.first ?? nil } }
+    func enumValues(_ table: String) throws -> [String: [String]] { [:] }
 }
 
 struct ForeignKey: Hashable {
@@ -396,6 +399,10 @@ final class PostgresDB: Database {
         let info = kv("host", host) + (via.map { kv("hostaddr", $0.host) + kv("port", $0.port) } ?? kv("port", port))
             + kv("user", user) + kv("password", password)
             + kv("dbname", database) + "connect_timeout=10 application_name=Kueri"
+            // A server that vanished (sleep, Wi-Fi change, restart) otherwise leaves the socket
+            // ESTABLISHED and every query waiting forever; with keepalives it fails in ~25 s with a
+            // connection error, which offers Reconnect.
+            + " keepalives=1 keepalives_idle=10 keepalives_interval=5 keepalives_count=3"
             + (allowCleartextPassword ? "" : " require_auth=!password")
             + " sslmode=" + ["off": "disable", "prefer": "prefer", "required": "require", "verify": "verify-full"][tls.rawValue]!
             + (tls == .verify ? " sslrootcert=system" : "") // the system's trusted CAs (libpq 16+)
@@ -586,6 +593,17 @@ final class PostgresDB: Database {
         "SELECT * FROM \(quote(table: t)) WHERE \(quoteIdent(column)) = \(Self.literal(value)) LIMIT \(pageSize)"
     }
 
+    func enumValues(_ t: String) throws -> [String: [String]] {
+        let rows = try execParams("""
+            SELECT a.attname, e.enumlabel FROM pg_attribute a JOIN pg_enum e ON e.enumtypid = a.atttypid
+            WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped
+            ORDER BY a.attnum, e.enumsortorder
+            """, [quote(table: t)]).rows
+        var m: [String: [String]] = [:]
+        for r in rows { if let c = r[0], let v = r[1] { m[c, default: []].append(v) } }
+        return m
+    }
+
     static func literal(_ v: String) -> String {
         "E'" + v.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "''") + "'"
     }
@@ -672,7 +690,7 @@ func selfTest() {
     assert(RootView.restorable(saved, connID: "deleted-or-empty", database: "x") == nil)
     // Highlighting only colors: the text is identical to the formatted JSON.
     let pretty = prettyJSON(#"{"id":"hlz8\"x","n":-1.5e3,"ok":true,"z":null,"a":[{"k":"v: x"}]}"#)!
-    assert(String(highlightJSON(pretty).characters) == pretty)
+    assert(jsonTokens(#"{"a": [1, true], "b": "x"}"#).map(\.1) == [.punctuation, .key, .punctuation, .punctuation, .number, .punctuation, .literal, .punctuation, .punctuation, .key, .punctuation, .string, .punctuation])
     // Search marks every case-insensitive hit and nothing else.
     let m = markMatches(AttributedString(#"{"owner": "x", "OWNER_id": 1}"#), "owner")
     assert(m.runs.filter { $0.backgroundColor != nil }.map { String(m[$0.range].characters) } == ["owner", "OWNER"])
@@ -687,6 +705,11 @@ func selfTest() {
     _ = try! db.query("INSERT INTO parent(id, name) VALUES (1, 'a'), (2, 'it''s')")
     assert(try! db.query(db.filterQuery("parent", column: "name", value: "it's")).rows == [["2", "it's"]])
     assert(PostgresDB.literal(#"a\'b"#) == #"E'a\\''b'"#)
+    assert(minifyJSON("{\n  \"a b\": [1, 2],\n  \"c\": \"x y\"\n}") == #"{"a b":[1,2],"c":"x y"}"#)
+    assert(minifyJSON("not json") == nil)
+    assert(Session.isConnectionLost("no connection to the server\n") && Session.isConnectionLost("server closed the connection unexpectedly")
+           && !Session.isConnectionLost("syntax error at or near \"selec\""))
+    assert(MySQLDB.enumLabels("enum('a','it''s','b,c')") == ["a", "it's", "b,c"])
     assert(try! db.delete("parent", key: [("id", "1")]) == 1 && db.delete("parent", key: [("id", "1")]) == 0)
     assert(try! db.query("SELECT id FROM parent").rows == [["2"]])
     _ = try! db.query("DELETE FROM parent")

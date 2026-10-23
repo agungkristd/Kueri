@@ -13,6 +13,7 @@ struct WorkTab: Identifiable {
     var edits: [Int: [Int: String?]] = [:]
     var table: String?
     var primaryKey: [String] = []
+    var enumValues: [String: [String]] = [:]
     var browsed: (query: String, table: String, offset: Int)?
     var offset = 0
     var error: String?

@@ -26,14 +26,16 @@ struct WorkspaceView: View {
     @State private var sidebarTab = SidebarTab.items
     @State private var pendingSchema = false
     @State private var pendingDatabase = false
+    @State private var pendingOwner = false
     @State private var transferMode: TransferSheet.Mode?
     @State private var showProcesses = false
+    @Environment(\.undoManager) private var undoManager // the window's: Edit › Undo and ⌘Z drive it
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
             VStack(spacing: 0) {
                 if !session.databases.isEmpty {
-                    DatabaseSwitcher(session: session, newDatabase: { pendingDatabase = true })
+                    DatabaseSwitcher(session: session, newDatabase: { pendingDatabase = true }, changeOwner: { pendingOwner = true })
                         .padding(.horizontal, 10).padding(.top, 8)
                         .zIndex(1) // the dropdown draws over the tabs and table list below
                 }
@@ -81,20 +83,26 @@ struct WorkspaceView: View {
                 }
                 if session.conn.kind != .redis {
                     SidebarFooter(session: session, newSchema: { pendingSchema = true }, newDatabase: { pendingDatabase = true },
+                                  changeOwner: { pendingOwner = true },
                                   transfer: { transferMode = $0 })
                 }
             }
             .sheet(isPresented: $pendingSchema) { NewSchemaSheet(session: session) { pendingSchema = false } }
             .sheet(isPresented: $pendingDatabase) { NewSchemaSheet(session: session, what: .database) { pendingDatabase = false } }
+            .sheet(isPresented: $pendingOwner) { DatabaseOwnerSheet(session: session) { pendingOwner = false } }
             .sheet(isPresented: $showProcesses) { ProcessListSheet(session: session) { showProcesses = false } }
             .sheet(isPresented: Binding(get: { transferMode != nil }, set: { if !$0 { transferMode = nil } })) {
                 if let m = transferMode { TransferSheet(mode: m, session: session) { transferMode = nil } }
             }
             .navigationSplitViewColumnWidth(min: 200, ideal: 260)
+            // Solid, darker than the content: the default sidebar material is lighter and changes
+            // tone whenever the window gains or loses focus (asked for).
+            .background(Color(nsColor: .textBackgroundColor).ignoresSafeArea())
             .toolbar(removing: .sidebarToggle) // the toolbar's Sidebar button (with its keymap shortcut) does this
         } detail: {
           VStack(spacing: 0) {
             TabStrip(session: session)
+            ConnectionLostBar(session: session)
             switch session.kind {
             case .structure(let t):
                 StructureView(session: session, table: t)
@@ -119,13 +127,13 @@ struct WorkspaceView: View {
                                     .disabled(session.sql.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             }
                             .padding(.horizontal, 6).padding(.vertical, 3)
-                            .background(Color(nsColor: .textBackgroundColor))
+                            .background(Color(nsColor: .windowBackgroundColor))
                         }
                     }
                     .frame(minHeight: 80, idealHeight: 160)
                 }
                 VStack(spacing: 0) {
-                    if let e = session.error {
+                    if let e = session.error, !session.connectionLost { // the banner above shows that one
                         Text(e).foregroundStyle(.red).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(8)
                     }
                     ResultGrid(result: session.result, selection: $session.selectedRow, edits: session.edits,
@@ -220,7 +228,8 @@ struct WorkspaceView: View {
                     if rightTab == .row {
                         RowDetails(result: session.result, row: session.selectedRow, readOnlyReason: session.readOnlyReason,
                                    edits: Binding(get: { session.selectedRow.flatMap { session.edits[$0] } ?? [:] },
-                                                  set: { new in if let r = session.selectedRow { session.edits[r] = new.isEmpty ? nil : new } }))
+                                                  set: { new in if let r = session.selectedRow { session.setRowEdits(r, new) } }),
+                                   enumValues: session.enumValues)
                     } else if let t = inspectedName {
                         DiagramTableInfo(name: t, session: session, load: { t in try? await session.onQueue { try $0.structure(t) } },
                                          draft: $tableDraft) { handle($0, t) }
@@ -228,15 +237,20 @@ struct WorkspaceView: View {
                     } else {
                         ContentUnavailableView("No table", systemImage: "tablecells",
                                                description: Text("Open a table, or double-click one in the diagram."))
+                            .frame(maxHeight: .infinity) // fills the panel, so the tabs stay at the top
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .background(Color(nsColor: .textBackgroundColor).ignoresSafeArea()) // like the sidebar
                 .onChange(of: inspectedName) { _, t in if let t, t != tableDraft.table { tableDraft = TableDraft(table: t) } }
                 .inspectorColumnWidth(min: 260, ideal: 380, max: 700)
             }
         }
+        .onAppear { session.undoManager = undoManager }
+        .onChange(of: undoManager.map(ObjectIdentifier.init)) { session.undoManager = undoManager }
         // Window-level toolbar: placement no longer depends on which split-view columns are visible.
         .toolbar {
-            ToolbarItem(placement: .principal) { ConnectionBar(session: session) }
+            ToolbarItem(placement: .navigation) { ConnectionBar(session: session) } // leading, next to the window controls
         }
         .toolbar {
           // Same position whether or not the sidebar is visible (window-level, not per split column).
