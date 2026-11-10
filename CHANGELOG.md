@@ -3,7 +3,7 @@
 Versions follow [Semantic Versioning](https://semver.org). Release builds are attached to the
 [GitHub releases](https://github.com/agungkristd/Kueri/releases) with their SHA-256 checksum.
 
-## Unreleased
+## 1.1.5
 
 - Fixed: a details field that fit exactly in its collapsed height still offered Show all.
 - Fixed: after running a query, a click on a result row whose index matched the previously selected row left the Details panel empty.
