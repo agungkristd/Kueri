@@ -116,6 +116,12 @@ import SwiftUI
         tv.keyDown(with: NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
                                           context: nil, characters: "\u{7f}", charactersIgnoringModifiers: "\u{7f}", isARepeat: false, keyCode: 51)!)
         check("Delete key deletes every selected row", deleted == [1, 3])
+        // A new result (a query after a browse) must drop the table's own selection, otherwise a click on the
+        // same row index fires no selectionDidChange and the Details panel stays empty.
+        tv.selectRowIndexes([0], byExtendingSelection: false)
+        multiHost.rootView = ResultGrid(result: QueryResult(columns: ["id"], rows: [["7"]]), filter: "")
+        multiHost.layoutSubtreeIfNeeded()
+        check("a new result clears the grid selection", tv.selectedRow == -1)
     } else { check("multi grid found", false) }
 
     // Tabs: a second window joins the first one's tab group

@@ -441,6 +441,9 @@ struct ResultGrid: NSViewRepresentable {
         }
         let keptRow = keepPosition && tv.selectedRow >= 0 ? tv.selectedRow : nil
         let keptScroll = sv.contentView.bounds.origin
+        // reloadData keeps a row selected when its index is still valid in the new result. The session
+        // already cleared selectedRow, so a click on that same row would fire no selectionDidChange.
+        if !keepPosition { tv.deselectAll(nil) }
         c.result = result
         c.filter = filter
         c.visible = Self.matching(result, filter)

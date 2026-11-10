@@ -6,6 +6,7 @@ Versions follow [Semantic Versioning](https://semver.org). Release builds are at
 ## Unreleased
 
 - Fixed: a details field that fit exactly in its collapsed height still offered Show all.
+- Fixed: after running a query, a click on a result row whose index matched the previously selected row left the Details panel empty.
 
 ## 1.1.4
 
